@@ -112,37 +112,33 @@ def money_br(value: Any) -> str:
 
 
 def _pdf_escape(text: str) -> str:
-    return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    # PDF standard fonts (Helvetica) use WinAnsiEncoding by default
+    # We ensure characters are correctly represented in that encoding
+    if not text:
+        return ""
+    text = str(text)
+    # Escapes basic PDF delimiters
+    text = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    return text
 
 
-def build_text_pdf_bytes(lines: List[str], title: str = "Boleto") -> bytes:
+def build_text_pdf_bytes(ops: List[str]) -> bytes:
     page_width = 595
     page_height = 842
-    start_x = 36
-    start_y = 805
-    line_height = 14
-
-    stream_parts = ["BT", "/F1 10 Tf", f"{start_x} {start_y} Td"]
-    first = True
-    for raw_line in [title, ""] + list(lines):
-        line = _pdf_escape(raw_line)
-        if first:
-            stream_parts.append(f"({line}) Tj")
-            first = False
-        else:
-            stream_parts.append(f"0 -{line_height} Td")
-            stream_parts.append(f"({line}) Tj")
-    stream_parts.append("ET")
-    stream = "\n".join(stream_parts).encode("latin-1", errors="replace")
+    
+    stream_content = "\n".join(ops)
+    # CP1252 is WinAnsiEncoding, standard for PDF fonts and supports PT accents
+    stream = stream_content.encode("cp1252", errors="replace")
 
     objects = []
     objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
     objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
     objects.append(
-        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode("latin-1")
+        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode("cp1252")
     )
     objects.append(b"4 0 obj\n<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream\nendobj\n")
     objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+    objects.append(b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n")
 
     pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offsets = [0]
@@ -160,7 +156,8 @@ def build_text_pdf_bytes(lines: List[str], title: str = "Boleto") -> bytes:
 
 
 def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow") -> bytes:
-    bank_code = str(boleto_data.get("banco_codigo") or "")
+    # Coleta de dados
+    bank_code = str(boleto_data.get("banco_codigo") or "000").strip()
     bank_name = str(boleto_data.get("banco_nome") or boleto_data.get("portador_nome") or "").strip()
     portador_name = str(boleto_data.get("portador_nome") or "").strip()
     carteira = str(boleto_data.get("portador_carteira") or "").strip()
@@ -183,49 +180,167 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
     vencto = str(boleto_data.get("vencto_display") or invoice_row.due_date_display()).strip()
     valor = str(boleto_data.get("valor_display") or invoice_row.open_balance_display()).strip()
     mensagem = str(boleto_data.get("mensagem") or "").strip()
+    
+    agencia_conta = f"{agencia}-{agencia_dv} / {conta}-{conta_dv}".replace("--", "-").strip(" /")
 
-    agencia_fmt = f"{agencia}-{agencia_dv}".strip("-")
-    conta_fmt = f"{conta}-{conta_dv}".strip("-")
-    account_display = (f"{invoice_row.account_code or ''} - {invoice_row.account_name or ''}").strip(" -")
+    ops = []
 
-    title = f"Boleto bancário - {bank_code} {bank_name}".strip()
-    lines = [
-        "=" * 80,
-        f"PORTADOR: {portador_name}",
-        f"BANCO: {bank_code} - {bank_name}",
-        f"AGÊNCIA: {agencia_fmt}    CONTA: {conta_fmt}",
-        f"CARTEIRA: {carteira}    CONVÊNIO: {convenio}    CONTRATO: {contrato}",
-        "=" * 80,
-        f"CEDENTE / BENEFICIÁRIO: {cedente_nome}",
-        f"DOCUMENTO DO CEDENTE: {cedente_doc}",
-        "",
-        f"SACADO: {sacado_nome}",
-        f"DOCUMENTO DO SACADO: {sacado_doc}",
-        f"ENDEREÇO: {sacado_end}",
-        f"CIDADE/UF: {cidade_uf}",
-        "",
-        f"DOCUMENTO: {documento}",
-        f"NOSSO NÚMERO: {nosso_numero}",
-        f"EMISSÃO DA FATURA: {invoice_row.issue_date_display()}",
-        f"VENCIMENTO: {vencto}",
-        f"VALOR DO BOLETO: {valor}",
-        f"CONTA FINANCEIRA: {account_display}",
-        "",
-        "-" * 80,
-        "LINHA DIGITÁVEL",
-        linha_digitavel,
-        "-" * 80,
-        "CÓDIGO DE BARRAS",
-        codigo_barra,
-        "-" * 80,
-    ]
+    def draw_text(x, y, text, size=9, bold=False):
+        text = _pdf_escape(text)
+        font = "/F2" if bold else "/F1"
+        ops.append("BT")
+        ops.append(f"{font} {size} Tf")
+        ops.append(f"{x} {y} Td")
+        ops.append(f"({text}) Tj")
+        ops.append("ET")
+
+    def draw_line(x1, y1, x2, y2, width=0.5):
+        ops.append(f"{width} w")
+        ops.append(f"{x1} {y1} m")
+        ops.append(f"{x2} {y2} l")
+        ops.append("S")
+
+    def draw_rect(x, y, w, h, fill=False):
+        ops.append(f"{x} {y} {w} {h} re")
+        ops.append("f" if fill else "S")
+
+    # Margens e Posições
+    left = 40
+    base_y = 380  # Começa na metade da página para a Ficha de Compensação
+    width = 515
+    
+    # Título Geral
+    draw_text(left, base_y + 440, "BOLETO INFORMATIVO - DATAHUB", size=11, bold=True)
+    draw_text(left, base_y + 430, "Este documento é apenas informativo e não substitui o título original.", size=7)
+    
+    # --- CABEÇALHO (Recibo do Pagador) ---
+    draw_line(left, base_y + 420, left + width, base_y + 420, width=1) # Topo
+    draw_text(left, base_y + 405, f"RECIBO DO PAGADOR", size=10, bold=True)
+    
+    curr_y = base_y + 380
+    draw_text(left, curr_y, f"Cedente: {cedente_nome}", size=9)
+    draw_text(left + 350, curr_y, f"CNPJ/CPF: {cedente_doc}", size=9)
+    
+    curr_y -= 15
+    draw_text(left, curr_y, f"Sacado: {sacado_nome}", size=9)
+    draw_text(left + 350, curr_y, f"Vencimento: {vencto}", size=9)
+    
+    curr_y -= 15
+    draw_text(left, curr_y, f"Nosso Número: {nosso_numero}", size=9)
+    draw_text(left + 350, curr_y, f"Valor: {valor}", size=9)
+    
+    draw_line(left, base_y + 340, left + width, base_y + 340, width=0.5) # Divisor
+    
+    # --- FICHA DE COMPENSAÇÃO (Layout Padrão) ---
+    y = base_y
+    h_row = 20
+    
+    # Linhas Horizontais Principais
+    draw_line(left, y + 250, left + width, y + 250, width=1.5) # Topo da ficha
+    draw_line(left, y + 225, left + width, y + 225, width=0.8)
+    draw_line(left, y + 205, left + width, y + 205, width=0.8)
+    draw_line(left, y + 185, left + width, y + 185, width=0.8)
+    draw_line(left, y + 165, left + width, y + 165, width=0.8)
+    draw_line(left, y + 145, left + width, y + 145, width=0.8)
+    draw_line(left, y + 65, left + width, y + 65, width=0.8) # Base do quadro principal
+    
+    # Linhas Verticais
+    draw_line(left + 60, y + 225, left + 60, y + 250, width=1) # Divisor banco
+    draw_line(left + 140, y + 225, left + 140, y + 250, width=1) # Divisor banco
+    draw_line(left + 380, y + 65, left + 380, y + 225, width=0.8) # Coluna da direita (valores)
+    
+    # Textos do Cabeçalho da Ficha
+    draw_text(left + 65, y + 232, bank_code, size=14, bold=True)
+    draw_text(left + 150, y + 232, bank_name[:30], size=12, bold=True)
+    draw_text(left + 330, y + 232, linha_digitavel, size=10, bold=True)
+    
+    # Linha 1: Local de Pagamento e Vencimento
+    draw_text(left + 5, y + 217, "Local de Pagamento", size=6)
+    draw_text(left + 5, y + 208, "QUALQUER BANCO ATÉ O VENCIMENTO", size=8)
+    draw_text(left + 385, y + 217, "Vencimento", size=6)
+    draw_text(left + 385, y + 208, vencto, size=9, bold=True)
+    
+    # Linha 2: Cedente e Agência/Código Cedente
+    draw_text(left + 5, y + 197, "Cedente", size=6)
+    draw_text(left + 5, y + 188, cedente_nome, size=8)
+    draw_text(left + 385, y + 197, "Agência/Código Cedente", size=6)
+    draw_text(left + 385, y + 188, agencia_conta, size=9)
+    
+    # Linha 3: Datas e Nosso Número
+    draw_text(left + 5, y + 177, "Data do Documento", size=6)
+    draw_text(left + 5, y + 168, date.today().strftime("%d/%m/%Y"), size=8)
+    draw_text(left + 100, y + 177, "Nº do Documento", size=6)
+    draw_text(left + 100, y + 168, documento, size=8)
+    draw_text(left + 200, y + 177, "Espécie Doc.", size=6)
+    draw_text(left + 200, y + 168, "DM", size=8)
+    draw_text(left + 250, y + 177, "Aceite", size=6)
+    draw_text(left + 250, y + 168, "N", size=8)
+    draw_text(left + 300, y + 177, "Data Proc.", size=6)
+    draw_text(left + 300, y + 168, date.today().strftime("%d/%m/%Y"), size=8)
+    draw_text(left + 385, y + 177, "Nosso Número", size=6)
+    draw_text(left + 385, y + 168, nosso_numero, size=9)
+    
+    # Linha 4: Uso do Banco, Carteira, etc e Valor
+    draw_text(left + 5, y + 157, "Uso do Banco", size=6)
+    draw_text(left + 100, y + 157, "Carteira", size=6)
+    draw_text(left + 100, y + 148, carteira, size=8)
+    draw_text(left + 150, y + 157, "Espécie", size=6)
+    draw_text(left + 150, y + 148, "R$", size=8)
+    draw_text(left + 200, y + 157, "Quantidade", size=6)
+    draw_text(left + 300, y + 157, "Valor", size=6)
+    draw_text(left + 385, y + 157, "(=) Valor do Documento", size=6)
+    draw_text(left + 385, y + 148, valor, size=9, bold=True)
+    
+    # Campo de Instruções
+    draw_text(left + 5, y + 137, "Instruções", size=6)
     if mensagem:
-        lines.extend(["INSTRUÇÕES / MENSAGEM", mensagem, "-" * 80])
-    lines.extend([
-        "Observação: documento informativo gerado pelo DataHub com base nos dados do boleto e do portador.",
-        "Em caso de divergência visual, prevalecem a linha digitável e os dados bancários do título.",
-    ])
-    return build_text_pdf_bytes(lines, title=title)
+        msg_lines = mensagem.split("\n")
+        for i, mline in enumerate(msg_lines[:4]):
+            draw_text(left + 5, y + 125 - (i * 10), mline[:80], size=8)
+            
+    # Sacado
+    draw_rect(left, y + 20, width, 40)
+    draw_text(left + 5, y + 52, "Sacado", size=6)
+    draw_text(left + 45, y + 52, f"{sacado_nome} - {sacado_doc}", size=8, bold=True)
+    draw_text(left + 45, y + 42, sacado_end, size=8)
+    draw_text(left + 45, y + 32, cidade_uf, size=8)
+    
+    # --- CÓDIGO DE BARRAS (I25) ---
+    if codigo_barra and codigo_barra.isdigit() and len(codigo_barra) == 44:
+        # Lógica Intercalado 2 de 5
+        # 0: narrow, 1: wide
+        patterns = {
+            '0': '00110', '1': '10001', '2': '01001', '3': '11000', '4': '00101',
+            '5': '10100', '6': '01100', '7': '00011', '8': '10010', '9': '01010'
+        }
+        
+        start_pattern = "0000" # n n n n
+        stop_pattern = "100"  # w n n
+        
+        full_pattern = start_pattern
+        for i in range(0, 44, 2):
+            p1 = patterns[codigo_barra[i]]
+            p2 = patterns[codigo_barra[i+1]]
+            for j in range(5):
+                full_pattern += p1[j] + p2[j]
+        full_pattern += stop_pattern
+        
+        # Desenha as barras
+        bx = left
+        by = y - 30
+        bw_narrow = 0.75
+        bw_wide = 2.1
+        bh = 40
+        
+        for i, bit in enumerate(full_pattern):
+            is_bar = (i % 2 == 0)
+            bw = bw_wide if bit == '1' else bw_narrow
+            if is_bar:
+                draw_rect(bx, by, bw, bh, fill=True)
+            bx += bw
+
+    return build_text_pdf_bytes(ops)
+
 class SimpleDialog(tk.Toplevel):
     def __init__(self, master, title: str, size: str):
         super().__init__(master)
