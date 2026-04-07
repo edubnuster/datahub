@@ -112,13 +112,32 @@ def money_br(value: Any) -> str:
 
 
 def _pdf_escape(text: str) -> str:
-    # PDF standard fonts (Helvetica) use WinAnsiEncoding by default
-    # We ensure characters are correctly represented in that encoding
     if not text:
         return ""
     text = str(text)
-    # Escapes basic PDF delimiters
+    
+    # Standard PDF WinAnsi octal codes for common Portuguese characters
+    # (escaping the backslash for Python string)
+    rep = {
+        'á': r'\341', 'à': r'\340', 'â': r'\342', 'ã': r'\343',
+        'é': r'\351', 'ê': r'\352', 'í': r'\355',
+        'ó': r'\363', 'ô': r'\364', 'õ': r'\365', 'ú': r'\372',
+        'ç': r'\347',
+        'Á': r'\301', 'À': r'\300', 'Â': r'\302', 'Ã': r'\303',
+        'É': r'\311', 'Ê': r'\312', 'Í': r'\315',
+        'Ó': r'\323', 'Ô': r'\324', 'Õ': r'\325', 'Ú': r'\332',
+        'Ç': r'\307',
+        'º': r'\272', 'ª': r'\252'
+    }
+    
+    # First escape special PDF characters: \, (, )
     text = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    
+    # Then replace accented characters with their octal escape sequences
+    # These sequences use the literal backslash in the PDF stream.
+    for char, escape in rep.items():
+        text = text.replace(char, escape)
+        
     return text
 
 
@@ -127,18 +146,19 @@ def build_text_pdf_bytes(ops: List[str]) -> bytes:
     page_height = 842
     
     stream_content = "\n".join(ops)
-    # CP1252 is WinAnsiEncoding, standard for PDF fonts and supports PT accents
-    stream = stream_content.encode("cp1252", errors="replace")
+    # The octal escapes work best with latin-1 (iso-8859-1) encoding
+    # which is the default expected for PDF content streams
+    stream = stream_content.encode("latin-1", errors="replace")
 
     objects = []
     objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
     objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
     objects.append(
-        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode("cp1252")
+        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode("latin-1")
     )
     objects.append(b"4 0 obj\n<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream\nendobj\n")
-    objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
-    objects.append(b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n")
+    objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n")
+    objects.append(b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n")
 
     pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offsets = [0]
@@ -209,13 +229,9 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
     base_y = 380  # Começa na metade da página para a Ficha de Compensação
     width = 515
     
-    # Título Geral
-    draw_text(left, base_y + 440, "BOLETO INFORMATIVO - DATAHUB", size=11, bold=True)
-    draw_text(left, base_y + 430, "Este documento é apenas informativo e não substitui o título original.", size=7)
-    
     # --- CABEÇALHO (Recibo do Pagador) ---
     draw_line(left, base_y + 420, left + width, base_y + 420, width=1) # Topo
-    draw_text(left, base_y + 405, f"RECIBO DO PAGADOR", size=10, bold=True)
+    draw_text(left, base_y + 405, "RECIBO DO PAGADOR", size=10, bold=True)
     
     curr_y = base_y + 380
     draw_text(left, curr_y, f"Cedente: {cedente_nome}", size=9)
@@ -233,7 +249,6 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
     
     # --- FICHA DE COMPENSAÇÃO (Layout Padrão) ---
     y = base_y
-    h_row = 20
     
     # Linhas Horizontais Principais
     draw_line(left, y + 250, left + width, y + 250, width=1.5) # Topo da ficha
@@ -246,13 +261,14 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
     
     # Linhas Verticais
     draw_line(left + 60, y + 225, left + 60, y + 250, width=1) # Divisor banco
-    draw_line(left + 140, y + 225, left + 140, y + 250, width=1) # Divisor banco
+    draw_line(left + 120, y + 225, left + 120, y + 250, width=1) # Divisor banco
     draw_line(left + 380, y + 65, left + 380, y + 225, width=0.8) # Coluna da direita (valores)
     
     # Textos do Cabeçalho da Ficha
-    draw_text(left + 65, y + 232, bank_code, size=14, bold=True)
-    draw_text(left + 150, y + 232, bank_name[:30], size=12, bold=True)
-    draw_text(left + 330, y + 232, linha_digitavel, size=10, bold=True)
+    draw_text(left + 15, y + 232, bank_code, size=15, bold=True)
+    draw_text(left + 125, y + 232, bank_name[:25], size=11, bold=True)
+    # Linha Digitável alinhada à direita com fonte um pouco menor para caber
+    draw_text(left + 235, y + 232, linha_digitavel, size=9, bold=True)
     
     # Linha 1: Local de Pagamento e Vencimento
     draw_text(left + 5, y + 217, "Local de Pagamento", size=6)
