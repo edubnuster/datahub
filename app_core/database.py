@@ -160,10 +160,22 @@ class Database:
                 p.carteira as portador_carteira,
                 p.convenio as portador_convenio,
                 p.conta_corrente as portador_conta_corrente,
-                p.contrato as portador_contrato
+                p.contrato as portador_contrato,
+                cc.banco as banco_codigo,
+                bk.nome as banco_nome,
+                cc.agencia,
+                cc.agencia_digito,
+                cc.nr_conta,
+                cc.digito as conta_digito,
+                cc.modelo_boleto,
+                e.cpf as cedente_documento,
+                pessoa_nome_f(e.grid) as cedente_nome
             from boleto b
             left join boleto_info bi on bi.grid = b.boleto_info
             left join portador p on p.grid = b.portador
+            left join conta_corrente cc on cc.grid = p.conta_corrente
+            left join banco bk on bk.codigo = cc.banco
+            left join empresa e on e.grid = cc.empresa
             where b.movto = %s
             order by b.grid desc
             limit 1
@@ -219,6 +231,7 @@ class Database:
                 email_note = "Observação: foi localizado um boleto, mas o PDF não pôde ser anexado automaticamente."
             elif ob.get("erro"):
                 email_note = f"Observação: houve falha na geração automática do boleto: {ob.get('erro')}"
+
         if not email_note:
             email_note = "Observação: o boleto foi localizado e será gerado em PDF pelo app para envio em anexo."
 

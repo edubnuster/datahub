@@ -3,7 +3,6 @@ from copy import deepcopy
 import smtplib
 import ssl
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import re
 import tkinter as tk
@@ -101,6 +100,7 @@ def bind_date_entry_shortcuts(entry):
     entry.bind("<KeyPress>", _handle_keypress, add="+")
     entry.bind("<KeyRelease>", _format_typed_date, add="+")
 
+
 def money_br(value: Any) -> str:
     if value in (None, ""):
         return "0,00"
@@ -112,35 +112,34 @@ def money_br(value: Any) -> str:
 
 
 def _pdf_escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
 def build_text_pdf_bytes(lines: List[str], title: str = "Boleto") -> bytes:
     page_width = 595
     page_height = 842
-    start_x = 40
-    start_y = 800
-    line_height = 16
+    start_x = 36
+    start_y = 805
+    line_height = 14
 
-    content_lines = ["BT", "/F1 11 Tf", f"{start_x} {start_y} Td"]
+    stream_parts = ["BT", "/F1 10 Tf", f"{start_x} {start_y} Td"]
     first = True
     for raw_line in [title, ""] + list(lines):
-        line = _pdf_escape(str(raw_line))
+        line = _pdf_escape(raw_line)
         if first:
-            content_lines.append(f"({line}) Tj")
+            stream_parts.append(f"({line}) Tj")
             first = False
         else:
-            content_lines.append(f"0 -{line_height} Td")
-            content_lines.append(f"({line}) Tj")
-    content_lines.append("ET")
-    stream = "\n".join(content_lines).encode("latin-1", errors="replace")
+            stream_parts.append(f"0 -{line_height} Td")
+            stream_parts.append(f"({line}) Tj")
+    stream_parts.append("ET")
+    stream = "\n".join(stream_parts).encode("latin-1", errors="replace")
 
     objects = []
     objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
     objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
     objects.append(
-        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
-        f"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode("latin-1")
+        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode("latin-1")
     )
     objects.append(b"4 0 obj\n<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream\nendobj\n")
     objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
@@ -156,46 +155,77 @@ def build_text_pdf_bytes(lines: List[str], title: str = "Boleto") -> bytes:
     pdf.extend(b"0000000000 65535 f \n")
     for off in offsets[1:]:
         pdf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
-    pdf.extend(
-        f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF".encode("ascii")
-    )
+    pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF".encode("ascii"))
     return bytes(pdf)
 
 
 def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow") -> bytes:
-    company = invoice_row.company or ""
+    bank_code = str(boleto_data.get("banco_codigo") or "")
+    bank_name = str(boleto_data.get("banco_nome") or boleto_data.get("portador_nome") or "").strip()
+    portador_name = str(boleto_data.get("portador_nome") or "").strip()
+    carteira = str(boleto_data.get("portador_carteira") or "").strip()
+    convenio = str(boleto_data.get("portador_convenio") or "").strip()
+    contrato = str(boleto_data.get("portador_contrato") or "").strip()
+    agencia = str(boleto_data.get("agencia") or "").strip()
+    agencia_dv = str(boleto_data.get("agencia_digito") or "").strip()
+    conta = str(boleto_data.get("nr_conta") or "").strip()
+    conta_dv = str(boleto_data.get("conta_digito") or "").strip()
+    cedente_nome = str(boleto_data.get("cedente_nome") or invoice_row.company or "").strip()
+    cedente_doc = str(boleto_data.get("cedente_documento") or "").strip()
+    sacado_nome = str(boleto_data.get("sacado_nome") or invoice_row.customer_name or "").strip()
+    sacado_doc = str(boleto_data.get("sacado_inscricao") or "").strip()
+    sacado_end = str(boleto_data.get("sacado_endereco") or "").strip()
+    cidade_uf = str(boleto_data.get("sacado_cidade_uf") or "").strip()
+    documento = str(boleto_data.get("documento") or "").strip()
+    nosso_numero = str(boleto_data.get("nosso_numero") or "").strip()
+    linha_digitavel = str(boleto_data.get("linha_digitavel") or "").strip()
+    codigo_barra = str(boleto_data.get("codigo_barra") or "").strip()
+    vencto = str(boleto_data.get("vencto_display") or invoice_row.due_date_display()).strip()
+    valor = str(boleto_data.get("valor_display") or invoice_row.open_balance_display()).strip()
+    mensagem = str(boleto_data.get("mensagem") or "").strip()
+
+    agencia_fmt = f"{agencia}-{agencia_dv}".strip("-")
+    conta_fmt = f"{conta}-{conta_dv}".strip("-")
     account_display = (f"{invoice_row.account_code or ''} - {invoice_row.account_name or ''}").strip(" -")
+
+    title = f"Boleto bancário - {bank_code} {bank_name}".strip()
     lines = [
-        f"Empresa: {company}",
-        f"Cliente: {invoice_row.customer_name}",
-        f"Código do cliente: {invoice_row.customer_code}",
-        f"Conta: {account_display}",
+        "=" * 80,
+        f"PORTADOR: {portador_name}",
+        f"BANCO: {bank_code} - {bank_name}",
+        f"AGÊNCIA: {agencia_fmt}    CONTA: {conta_fmt}",
+        f"CARTEIRA: {carteira}    CONVÊNIO: {convenio}    CONTRATO: {contrato}",
+        "=" * 80,
+        f"CEDENTE / BENEFICIÁRIO: {cedente_nome}",
+        f"DOCUMENTO DO CEDENTE: {cedente_doc}",
         "",
-        "Dados do boleto",
-        f"Documento: {boleto_data.get('documento', '')}",
-        f"Vencimento: {boleto_data.get('vencto_display', '')}",
-        f"Valor: {boleto_data.get('valor_display', '')}",
-        f"Nosso número: {boleto_data.get('nosso_numero', '')}",
-        f"Linha digitável: {boleto_data.get('linha_digitavel', '')}",
-        f"Código de barras: {boleto_data.get('codigo_barra', '')}",
+        f"SACADO: {sacado_nome}",
+        f"DOCUMENTO DO SACADO: {sacado_doc}",
+        f"ENDEREÇO: {sacado_end}",
+        f"CIDADE/UF: {cidade_uf}",
         "",
-        "Sacado",
-        f"Nome: {boleto_data.get('sacado_nome', '')}",
-        f"Documento: {boleto_data.get('sacado_inscricao', '')}",
-        f"Endereço: {boleto_data.get('sacado_endereco', '')}",
-        f"Cidade/UF: {boleto_data.get('sacado_cidade_uf', '')}",
+        f"DOCUMENTO: {documento}",
+        f"NOSSO NÚMERO: {nosso_numero}",
+        f"EMISSÃO DA FATURA: {invoice_row.issue_date_display()}",
+        f"VENCIMENTO: {vencto}",
+        f"VALOR DO BOLETO: {valor}",
+        f"CONTA FINANCEIRA: {account_display}",
         "",
-        "Portador",
-        f"Nome: {boleto_data.get('portador_nome', '')}",
-        f"Código: {boleto_data.get('portador_codigo', '')}",
-        f"Carteira: {boleto_data.get('portador_carteira', '')}",
-        f"Convênio: {boleto_data.get('portador_convenio', '')}",
-        f"Conta corrente: {boleto_data.get('portador_conta_corrente', '')}",
+        "-" * 80,
+        "LINHA DIGITÁVEL",
+        linha_digitavel,
+        "-" * 80,
+        "CÓDIGO DE BARRAS",
+        codigo_barra,
+        "-" * 80,
     ]
-    mensagem = str(boleto_data.get("mensagem", "") or "").strip()
     if mensagem:
-        lines.extend(["", "Instruções", mensagem])
-    return build_text_pdf_bytes(lines, title="Boleto para pagamento")
+        lines.extend(["INSTRUÇÕES / MENSAGEM", mensagem, "-" * 80])
+    lines.extend([
+        "Observação: documento informativo gerado pelo DataHub com base nos dados do boleto e do portador.",
+        "Em caso de divergência visual, prevalecem a linha digitável e os dados bancários do título.",
+    ])
+    return build_text_pdf_bytes(lines, title=title)
 class SimpleDialog(tk.Toplevel):
     def __init__(self, master, title: str, size: str):
         super().__init__(master)
@@ -357,7 +387,6 @@ class ConfigWindow(SimpleDialog):
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Erro ao salvar configuração:\n\n{e}", parent=self)
 
-
 class EmailComposeWindow(SimpleDialog):
 
     def __init__(self, master, config_data: Dict[str, Any], current_user: str, invoice_row: InvoiceRow, customer_email: str):
@@ -365,19 +394,22 @@ class EmailComposeWindow(SimpleDialog):
         self.current_user = current_user
         self.invoice_row = invoice_row
         self.customer_email = customer_email or ""
-        self.boleto_data = {}
+        self.boleto_data: Dict[str, Any] = {}
         self.attachment_bytes = None
         self.attachment_name = ""
-        self.boleto_status_text = ""
+        self.boleto_status_text = "Boleto ainda não gerado"
         self._prepare_boleto_attachment()
-        super().__init__(master, "Enviar fatura por e-mail", "760x660")
+        super().__init__(master, "Enviar fatura por e-mail", "760x680")
         self._build()
 
     def _prepare_boleto_attachment(self):
         try:
             payload = Database(self.config_data).get_boleto_email_payload(self.invoice_row.invoice_id)
-        except Exception:
-            payload = {"exists": False, "email_note": "Observação: não foi possível consultar os dados do boleto neste momento."}
+        except Exception as e:
+            payload = {
+                "exists": False,
+                "email_note": f"Observação: não foi possível consultar os dados do boleto neste momento. {e}",
+            }
 
         self.boleto_data = payload or {}
         if not self.boleto_data.get("exists"):
@@ -429,7 +461,9 @@ class EmailComposeWindow(SimpleDialog):
             f"Desconto: {self.invoice_row.discount_amount_display()}\n"
             f"Saldo em aberto: {self.invoice_row.open_balance_display()}\n\n"
             f"{note}\n\n"
-            f"Em caso de dúvidas, ficamos à disposição."
+            f"Em caso de dúvidas, ficamos à disposição.\n\n"
+            f"Atenciosamente,\n"
+            f"{company}"
         )
 
     def _build(self):
@@ -525,6 +559,7 @@ class EmailComposeWindow(SimpleDialog):
             self.destroy()
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Falha ao enviar e-mail:\n\n{e}", parent=self)
+
 class CreateUserWindow(SimpleDialog):
     def __init__(self, master, config_data: Dict[str, Any], current_user: str, on_save):
         self.config_data = deepcopy(config_data)
