@@ -1,0 +1,37 @@
+{
+    "connection": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "dbname": "autosystem",
+        "user": "postgres",
+        "password": "postgres",
+        "client_encoding": "LATIN1"
+    },
+    "security": {
+        "users": [
+            {
+                "username": "volnei",
+                "password_hash": "wrrOVktI8xAQq0yisKtzKOep36Va6+266zdmob2b5A4=",
+                "password_salt": "ZugJNuYQROEAdnJe0rNbcg=="
+            },
+            {
+                "username": "eduardo",
+                "password_hash": "62YYnmYFYZD5FWz8vg918cQBcWCfn3+fU7Mi5SDaB7c=",
+                "password_salt": "PnqhRRkkVy/otmTyBS6Gmw=="
+            }
+        ]
+    },
+    "smtp": {
+        "email": "app@databrev.com.br",
+        "host": "smtp.zoho.com",
+        "password": "6UBwERuJiqJi",
+        "port": 465
+    },
+    "queries": {
+        "list_inactive_customers_sql": "\nselect\n    c.grid as customer_id,\n    pessoa_nome_f(l.empresa) as last_purchase_company,\n    c.codigo as customer_code,\n    c.nome as customer_name,\n    coalesce(co.nome, 'Sem conta') as account_name,\n    max(case when pc.pessoa is not null then 1 else 0 end) as has_account,\n    coalesce(pc.lim_credito, 0) as credit_limit,\n    max(l.data) as last_purchase_date,\n    case c.flag\n        when 'A' then 'Ativo'\n        when 'I' then 'Inativo'\n        when 'D' then 'Deletado'\n        else coalesce(c.flag, '')\n    end as customer_status\nfrom cliente c\njoin lancto l\n    on l.pessoa = c.grid\nleft join pessoa_conta pc\n    on pc.pessoa = c.grid\nleft join conta co\n    on co.codigo = pc.conta\nwhere l.operacao = 'V'\ngroup by\n    c.grid,\n    l.empresa,\n    c.codigo,\n    c.nome,\n    coalesce(co.nome, 'Sem conta'),\n    coalesce(pc.lim_credito, 0),\n    c.flag,\n    pessoa_nome_f(l.empresa)\nhaving max(l.data) < current_date - interval '3 months'\norder by pessoa_nome_f(l.empresa), max(l.data)\n",
+        "list_open_invoices_sql": "\nWITH titulos AS (\n    SELECT\n        m.grid AS movto_id,\n        m.empresa,\n        m.pessoa AS customer_id,\n        p.codigo AS codigo_cliente,\n        p.nome AS cliente,\n        m.conta_debitar AS conta,\n        conta_nome_f(m.conta_debitar) AS conta_nome,\n        m.data,\n        m.vencto,\n        m.valor,\n        COALESCE((\n            SELECT SUM(fl.valor_desconto)\n            FROM fatura_lancto fl\n            WHERE fl.movto = m.grid\n        ), 0) AS valor_desconto,\n        COALESCE((\n            SELECT SUM(d.valor)\n            FROM movto_map mp\n            JOIN movto d ON d.grid = mp.child\n            WHERE mp.parent = m.grid\n              AND d.motivo = 155\n        ), 0) AS valor_baixado\n    FROM movto m\n    JOIN pessoa p\n      ON p.grid = m.pessoa\n    WHERE m.pessoa IS NOT NULL\n      AND m.vencto <= current_date\n      AND COALESCE(m.valor, 0) > 0\n      AND m.child = 0\n      AND m.conta_debitar LIKE '1.3.04%'\n)\nSELECT\n    movto_id,\n    pessoa_nome_f(t.empresa) AS empresa,\n    t.customer_id,\n    t.codigo_cliente,\n    t.cliente,\n    t.conta,\n    t.conta_nome,\n    t.data,\n    t.vencto,\n    t.valor,\n    t.valor_desconto,\n    t.valor_baixado,\n    (t.valor - t.valor_desconto - t.valor_baixado) AS saldo_em_aberto\nFROM titulos t\nWHERE (t.valor - t.valor_desconto - t.valor_baixado) > 0\nORDER BY empresa, cliente, t.vencto\n",
+        "delete_customer_sql": "\n            update cliente\n               set flag = 'D'\n             where grid = %(customer_id)s\n        ",
+        "inactivate_customer_sql": "\n            update cliente\n               set flag = 'I'\n             where grid = %(customer_id)s\n        ",
+        "disable_credit_sql": "\n            update pessoa_conta pc\n               set lim_credito = 0\n             where pc.pessoa = %(customer_id)s\n        "
+    }
+}

@@ -1,0 +1,1 @@
+# pacote app_core

@@ -1,0 +1,30 @@
+{
+    "connection": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "dbname": "autosystem",
+        "user": "postgres",
+        "password": "postgres",
+        "client_encoding": "LATIN1"
+    },
+    "security": {
+        "users": [
+            {
+                "username": "volnei",
+                "password_hash": "wrrOVktI8xAQq0yisKtzKOep36Va6+266zdmob2b5A4=",
+                "password_salt": "ZugJNuYQROEAdnJe0rNbcg=="
+            },
+            {
+                "username": "eduardo",
+                "password_hash": "62YYnmYFYZD5FWz8vg918cQBcWCfn3+fU7Mi5SDaB7c=",
+                "password_salt": "PnqhRRkkVy/otmTyBS6Gmw=="
+            }
+        ]
+    },
+    "queries": {
+        "list_inactive_customers_sql": "\nselect\n    c.grid as customer_id,\n    pessoa_nome_f(l.empresa) as last_purchase_company,\n    c.codigo as customer_code,\n    c.nome as customer_name,\n    coalesce(co.nome, 'Sem conta') as account_name,\n    coalesce(pc.lim_credito, 0) as credit_limit,\n    max(l.data) as last_purchase_date,\n    case c.flag\n        when 'A' then 'Ativo'\n        when 'I' then 'Inativo'\n        when 'D' then 'Deletado'\n        else coalesce(c.flag, '')\n    end as customer_status\nfrom cliente c\njoin lancto l\n    on l.pessoa = c.grid\nleft join pessoa_conta pc\n    on pc.pessoa = c.grid\nleft join conta co\n    on co.codigo = pc.conta\nwhere l.operacao = 'V'\ngroup by\n    c.grid,\n    l.empresa,\n    c.codigo,\n    c.nome,\n    coalesce(co.nome, 'Sem conta'),\n    coalesce(pc.lim_credito, 0),\n    c.flag,\n    pessoa_nome_f(l.empresa)\nhaving max(l.data) < current_date - interval '3 months'\norder by pessoa_nome_f(l.empresa), max(l.data)\n",
+        "delete_customer_sql": "\n            update cliente\n               set flag = 'D'\n             where grid = %(customer_id)s\n        ",
+        "inactivate_customer_sql": "\n            update cliente\n               set flag = 'I'\n             where grid = %(customer_id)s\n        ",
+        "disable_credit_sql": "\n            update pessoa_conta pc\n               set lim_credito = 0\n             where pc.pessoa = %(customer_id)s\n        "
+    }
+}
