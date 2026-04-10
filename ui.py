@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import html
+import os
 import smtplib
 import ssl
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import re
+import threading
+import time as time_module
 import tkinter as tk
 from tkinter import ttk, messagebox
 from email.message import EmailMessage
@@ -19,6 +24,20 @@ from app_core.models import CustomerRow, InvoiceRow
 
 
 DATE_INPUT_FORMAT = "%d/%m/%Y"
+
+
+def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
+    name = str(filename or "").strip().lower()
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    if ext == "pdf":
+        return "application", "pdf"
+    if ext == "png":
+        return "image", "png"
+    if ext in ("jpg", "jpeg"):
+        return "image", "jpeg"
+    if ext in ("tif", "tiff"):
+        return "image", "tiff"
+    return "application", "octet-stream"
 
 
 def format_date_br(value: date) -> str:
@@ -111,6 +130,611 @@ def money_br(value: Any) -> str:
         return str(value)
 
 
+def pix_amount_str(value: Any) -> Optional[str]:
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = re.sub(r"[^\d,.\-]", "", s)
+        if not s:
+            return None
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        elif "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+        d = Decimal(s).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if d <= 0:
+            return None
+        return f"{d:.2f}"
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def build_pix_brcode_payload(chave, nome, cidade, valor, txid: str = "***") -> str:
+    def f(field_id: int, val: Any) -> str:
+        val = str(val or "")
+        return f"{field_id:02d}{len(val):02d}{val}"
+
+    chave_limpa = "".join(filter(str.isdigit, str(chave or "")))
+    if not chave_limpa:
+        chave_limpa = str(chave or "")
+
+    account_info = f(0, "br.gov.bcb.pix") + f(1, chave_limpa)
+    payload = f(0, "01")
+    payload += f(26, account_info)
+    payload += f(52, "0000")
+    payload += f(53, "986")
+    amount = pix_amount_str(valor)
+    if amount:
+        payload += f(54, amount)
+    payload += f(58, "BR")
+    payload += f(59, (nome or "RECEBEDOR")[:25])
+    payload += f(60, (cidade or "CIDADE")[:15])
+    payload += f(62, f(5, txid))
+    payload += "6304"
+
+    crc = 0xFFFF
+    for b in payload.encode("utf-8"):
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return payload + f"{crc:04X}"
+
+
+def _pix_payload_for_boleto(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow") -> str:
+    cedente_doc = str((boleto_data or {}).get("cedente_documento") or "").strip()
+    cedente_nome = str((boleto_data or {}).get("cedente_nome") or "").strip()
+    if not cedente_doc and not cedente_nome:
+        return ""
+    valor_src = (boleto_data or {}).get("valor")
+    if valor_src in (None, "", 0, "0"):
+        valor_src = getattr(invoice_row, "open_balance", None)
+    if valor_src in (None, "", 0, "0"):
+        valor_src = getattr(invoice_row, "amount", None)
+    if valor_src in (None, "", 0, "0"):
+        valor_src = str((boleto_data or {}).get("valor_display") or "").strip()
+    try:
+        return build_pix_brcode_payload(cedente_doc, cedente_nome, "CIDADE", valor_src, txid="***")
+    except Exception:
+        return ""
+
+def qty_br(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        num = float(value)
+        if abs(num - round(num)) < 1e-9:
+            return str(int(round(num)))
+        s = f"{num:.3f}".rstrip("0").rstrip(".")
+        return s.replace(".", ",")
+    except Exception:
+        return str(value)
+
+def datetime_br(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y %H:%M")
+    if isinstance(value, date):
+        return value.strftime("%d/%m/%Y")
+    return str(value)
+
+def build_purchase_info_blocks(invoice_row: InvoiceRow, purchase_info_map: Optional[Dict[Any, Dict[str, Any]]]) -> tuple[str, str]:
+    purchase_info_map = purchase_info_map or {}
+    key = getattr(invoice_row, "movto_id", None)
+    if key in (None, "", 0, "0"):
+        key = getattr(invoice_row, "invoice_id", None)
+    info = purchase_info_map.get(key) or purchase_info_map.get(str(key)) or {}
+    documents = info.get("documents") or []
+    items_total = info.get("items_total")
+    invoice_amount = info.get("invoice_amount")
+    if not documents and items_total in (None, ""):
+        return "", ""
+
+    lines: List[str] = []
+    lines.append("Informações da compra:")
+    for d in documents:
+        doc_no = str(d.get("documento") or "").strip() or "N/A"
+        doc_dt = d.get("dt")
+        doc_total = d.get("total")
+        header = f"- Documento: {doc_no}"
+        if doc_dt not in (None, ""):
+            header += f" | Data/hora: {datetime_br(doc_dt)}"
+        if doc_total not in (None, ""):
+            header += f" | Total: {money_br(doc_total)}"
+        lines.append(header)
+        for it in (d.get("items") or []):
+            prod = str(it.get("product") or "").strip() or "Item"
+            q = it.get("quantity")
+            t = it.get("item_total")
+            q_txt = qty_br(q) if q not in (None, "") else ""
+            t_txt = money_br(t) if t not in (None, "") else ""
+            lines.append(f"  - {prod} | Qtd: {q_txt} | Valor: {t_txt}".rstrip(" |"))
+    if items_total not in (None, ""):
+        lines.append(f"Total produtos: {money_br(items_total)}")
+    if invoice_amount not in (None, "") and items_total not in (None, ""):
+        try:
+            if abs(float(invoice_amount) - float(items_total)) > 0.01:
+                lines.append(f"Atenção: soma dos produtos ({money_br(items_total)}) difere do valor original da fatura ({money_br(invoice_amount)}).")
+        except Exception:
+            pass
+    text_block = "\n".join(lines).rstrip() + "\n"
+
+    html_rows: List[str] = []
+    for d in documents:
+        doc_no = str(d.get("documento") or "").strip() or "N/A"
+        doc_dt = d.get("dt")
+        doc_total = d.get("total")
+        doc_header = f"<b>Documento:</b> {html.escape(doc_no)}"
+        if doc_dt not in (None, ""):
+            doc_header += f" | <b>Data/hora:</b> {html.escape(datetime_br(doc_dt))}"
+        if doc_total not in (None, ""):
+            doc_header += f" | <b>Total:</b> {html.escape(money_br(doc_total))}"
+        html_rows.append(f"<tr style='background-color: #e9ecef;'><td colspan='3'>{doc_header}</td></tr>")
+        for it in (d.get("items") or []):
+            prod = str(it.get("product") or "").strip() or "Item"
+            q = it.get("quantity")
+            t = it.get("item_total")
+            q_txt = qty_br(q) if q not in (None, "") else ""
+            t_txt = money_br(t) if t not in (None, "") else ""
+            html_rows.append(
+                "<tr>"
+                f"<td>{html.escape(prod)}</td>"
+                f"<td>{html.escape(q_txt)}</td>"
+                f"<td>{html.escape(t_txt)}</td>"
+                "</tr>"
+            )
+    if items_total not in (None, ""):
+        html_rows.append(
+            "<tr style='background-color: #f8f9fa; font-weight: bold;'>"
+            "<td colspan='2' style='text-align: right;'>Total produtos</td>"
+            f"<td>{html.escape(money_br(items_total))}</td>"
+            "</tr>"
+        )
+    html_warn = ""
+    if invoice_amount not in (None, "") and items_total not in (None, ""):
+        try:
+            if abs(float(invoice_amount) - float(items_total)) > 0.01:
+                html_warn = (
+                    "<div class='note'>"
+                    f"<b>Atenção:</b> soma dos produtos ({html.escape(money_br(items_total))}) difere do valor original da fatura ({html.escape(money_br(invoice_amount))})."
+                    "</div>"
+                )
+        except Exception:
+            pass
+    html_block = (
+        "<h3>Informações da compra</h3>"
+        "<table>"
+        "<thead><tr><th>Produto</th><th>Qtd</th><th>Valor</th></tr></thead>"
+        f"<tbody>{''.join(html_rows)}</tbody>"
+        "</table>"
+        f"{html_warn}"
+    )
+    return "\n" + text_block + "\n", html_block
+
+
+def build_due_alert_email_body(customer_name: str, base_date: date, invoices: List["InvoiceRow"], missing_count: int, extra_body: str, purchase_info_map: Optional[Dict[Any, Dict[str, Any]]] = None) -> tuple[str, str]:
+    def _status_text(vencto: Any) -> str:
+        if not isinstance(vencto, date):
+            return ""
+        diff = (vencto - base_date).days
+        if diff == 0:
+            return "Seu boleto vence hoje."
+        if diff > 0:
+            return f"Seu boleto vencerá em {diff} dia(s)."
+        return f"Seu boleto está vencido há {abs(diff)} dia(s)."
+
+    total = 0.0
+    lines = []
+    html_rows = []
+    for inv in invoices:
+        try:
+            total += float(getattr(inv, "open_balance", 0) or 0)
+        except Exception:
+            pass
+        status = _status_text(getattr(inv, "due_date", None))
+        lines.append(f"- Fatura {inv.invoice_id} | Emissão: {inv.issue_date_display()} | Venc.: {inv.due_date_display()} | Saldo: {inv.open_balance_display()} | {status}")
+        html_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(inv.invoice_id))}</td>"
+            f"<td>{html.escape(inv.issue_date_display())}</td>"
+            f"<td>{html.escape(inv.due_date_display())}</td>"
+            f"<td>{html.escape(inv.amount_display())}</td>"
+            f"<td>{html.escape(inv.discount_amount_display())}</td>"
+            f"<td>{html.escape(inv.open_balance_display())}</td>"
+            f"<td>{html.escape(status)}</td>"
+            "</tr>"
+        )
+
+    note = ""
+    note_html = ""
+    if missing_count:
+        note = f"\nObservação: {missing_count} boleto(s) não puderam ser anexados automaticamente.\n"
+        note_html = f"<div style='margin:12px 0;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;color:#9a3412;'><b>Observação:</b> {missing_count} boleto(s) não puderam ser anexados automaticamente.</div>"
+
+    extra = str(extra_body or "").strip()
+    extra_text = f"{extra}\n\n" if extra else ""
+    extra_html = ""
+    if extra:
+        chunks = re.split(r"\n\s*\n", extra.strip())
+        extra_html = "".join([f"<p>{html.escape(c.strip()).replace(chr(10), '<br>')}</p>" for c in chunks if c.strip()])
+
+    company = str((invoices[0].company if invoices else "") or "").strip()
+    base_txt = base_date.strftime("%d/%m/%Y") if isinstance(base_date, date) else ""
+
+    purchase_text_parts: List[str] = []
+    purchase_html_parts: List[str] = []
+    for inv in invoices:
+        t, h = build_purchase_info_blocks(inv, purchase_info_map)
+        if str(t or "").strip():
+            purchase_text_parts.append(f"Fatura {inv.invoice_id}\n{str(t).strip()}")
+        if str(h or "").strip():
+            purchase_html_parts.append(f"<h4>Fatura {html.escape(str(inv.invoice_id))}</h4>{h}")
+    purchase_text = ("\n\n" + "\n\n".join(purchase_text_parts) + "\n") if purchase_text_parts else ""
+    purchase_html = ("<hr>" + "<hr>".join(purchase_html_parts)) if purchase_html_parts else ""
+
+    text_body = (
+        f"Prezado(a),\n\n"
+        f"Este é um alerta de vencimento do boleto.\n\n"
+        f"Cliente: {customer_name}\n"
+        f"Data de referência: {base_txt}\n"
+        f"Quantidade de títulos: {len(invoices)}\n"
+        f"Total em aberto: {money_br(total)}\n\n"
+        + "\n".join(lines)
+        + f"{purchase_text}\n"
+        + f"{note}\n\n"
+        + f"{extra_text}"
+        f"Em caso de dúvidas, estamos à disposição.\n\n"
+        f"Atenciosamente,\n"
+        f"{company}"
+    )
+
+    html_body = f"""<html>
+<head>
+<style>
+    body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
+    .card {{ max-width: 780px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #ffffff; }}
+    .title {{ font-size: 18px; font-weight: 700; color: #2563eb; margin: 0 0 10px 0; }}
+    .muted {{ color: #6b7280; margin: 0 0 14px 0; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 12px; }}
+    th {{ background-color: #f8fafc; text-align: left; padding: 10px; border: 1px solid #e5e7eb; }}
+    td {{ padding: 10px; border: 1px solid #e5e7eb; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="title">Alerta de vencimento de boleto</p>
+    <p class="muted">Cliente: <b>{html.escape(str(customer_name))}</b> &nbsp;|&nbsp; Data de referência: <b>{html.escape(base_txt)}</b></p>
+    <p><b>Quantidade de títulos:</b> {len(invoices)}<br><b>Total em aberto:</b> {html.escape(money_br(total))}</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Documento / Fatura</th>
+          <th>Emissão</th>
+          <th>Vencimento</th>
+          <th>Valor Original</th>
+          <th>Desconto</th>
+          <th>Saldo</th>
+          <th>Situação</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(html_rows)}
+      </tbody>
+    </table>
+    {purchase_html}
+    {note_html}
+    {extra_html}
+    <p>Em caso de dúvidas, estamos à disposição.</p>
+    <p>Atenciosamente,<br>{html.escape(company)}</p>
+  </div>
+</body>
+</html>"""
+    return text_body, html_body
+
+
+def build_agenda_email_body(
+    customer_name: str,
+    due_text: str,
+    invoices: List[InvoiceRow],
+    missing_count: int,
+    extra_body: str,
+    context_label: str = "Vencimento",
+    purchase_info_map: Optional[Dict[Any, Dict[str, Any]]] = None,
+) -> tuple[str, str]:
+    total = 0.0
+    lines = []
+    html_rows = []
+    for inv in invoices:
+        try:
+            total += float(getattr(inv, "open_balance", 0) or 0)
+        except Exception:
+            pass
+        lines.append(
+            f"- Fatura {inv.invoice_id} | Emissão: {inv.issue_date_display()} | Venc.: {inv.due_date_display()} | Saldo: {inv.open_balance_display()}"
+        )
+        html_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(inv.invoice_id))}</td>"
+            f"<td>{html.escape(inv.issue_date_display())}</td>"
+            f"<td>{html.escape(inv.due_date_display())}</td>"
+            f"<td>{html.escape(inv.amount_display())}</td>"
+            f"<td>{html.escape(inv.discount_amount_display())}</td>"
+            f"<td>{html.escape(inv.open_balance_display())}</td>"
+            "</tr>"
+        )
+
+    note = ""
+    note_html = ""
+    if missing_count:
+        note = f"\nObservação: {missing_count} boleto(s) não puderam ser anexados automaticamente.\n"
+        note_html = f"<div style='margin:12px 0;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;color:#9a3412;'><b>Observação:</b> {missing_count} boleto(s) não puderam ser anexados automaticamente.</div>"
+
+    extra = str(extra_body or "").strip()
+    extra_text = f"{extra}\n\n" if extra else ""
+    extra_html = ""
+    if extra:
+        chunks = re.split(r"\n\s*\n", extra.strip())
+        extra_html = "".join([f"<p>{html.escape(c.strip()).replace(chr(10), '<br>')}</p>" for c in chunks if c.strip()])
+
+    company = str((invoices[0].company if invoices else "") or "").strip()
+
+    purchase_text_parts: List[str] = []
+    purchase_html_parts: List[str] = []
+    for inv in invoices:
+        t, h = build_purchase_info_blocks(inv, purchase_info_map)
+        if str(t or "").strip():
+            purchase_text_parts.append(f"Fatura {inv.invoice_id}\n{str(t).strip()}")
+        if str(h or "").strip():
+            purchase_html_parts.append(f"<h4>Fatura {html.escape(str(inv.invoice_id))}</h4>{h}")
+    purchase_text = ("\n\n" + "\n\n".join(purchase_text_parts) + "\n") if purchase_text_parts else ""
+    purchase_html = ("<hr>" + "<hr>".join(purchase_html_parts)) if purchase_html_parts else ""
+
+    text_body = (
+        f"Prezado(a),\n\n"
+        f"Segue(m) fatura(s) para conferência e programação do pagamento.\n\n"
+        f"Cliente: {customer_name}\n"
+        f"{context_label}: {due_text}\n"
+        f"Quantidade de títulos: {len(invoices)}\n"
+        f"Total previsto: {money_br(total)}\n\n"
+        + "\n".join(lines)
+        + f"{purchase_text}\n"
+        + f"{note}\n\n"
+        + f"{extra_text}"
+        f"Em caso de dúvidas, ficamos à disposição.\n\n"
+        f"Atenciosamente,\n"
+        f"{company}"
+    )
+
+    html_body = f"""<html>
+<head>
+<style>
+    body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
+    .card {{ max-width: 780px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #ffffff; }}
+    .title {{ font-size: 18px; font-weight: 700; color: #2563eb; margin: 0 0 10px 0; }}
+    .muted {{ color: #6b7280; margin: 0 0 14px 0; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 12px; }}
+    th {{ background-color: #f8fafc; text-align: left; padding: 10px; border: 1px solid #e5e7eb; }}
+    td {{ padding: 10px; border: 1px solid #e5e7eb; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="title">Faturas para programação de pagamento</p>
+    <p class="muted">Cliente: <b>{html.escape(str(customer_name))}</b> &nbsp;|&nbsp; {html.escape(str(context_label))}: <b>{html.escape(str(due_text))}</b></p>
+    <p><b>Quantidade de títulos:</b> {len(invoices)}<br><b>Total previsto:</b> {html.escape(money_br(total))}</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Documento / Fatura</th>
+          <th>Emissão</th>
+          <th>Vencimento</th>
+          <th>Valor Original</th>
+          <th>Desconto</th>
+          <th>Saldo</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(html_rows)}
+      </tbody>
+    </table>
+    {purchase_html}
+    {note_html}
+    {extra_html}
+    <p>Em caso de dúvidas, ficamos à disposição.</p>
+    <p>Atenciosamente,<br>{html.escape(company)}</p>
+  </div>
+</body>
+</html>"""
+    return text_body, html_body
+
+
+class BusyOverlay:
+    def __init__(self, parent):
+        self.parent = parent
+        self._visible = False
+        self._prev_grab = None
+
+        top = tk.Toplevel(parent)
+        top.withdraw()
+        top.overrideredirect(True)
+        top.transient(parent)
+        trans_color = "#abcdef"
+        try:
+            top.configure(background=trans_color)
+            top.attributes("-transparentcolor", trans_color)
+        except Exception:
+            pass
+
+        outer = tk.Frame(top, bg=trans_color, padx=18, pady=18)
+        outer.pack(fill="both", expand=True)
+
+        box = ttk.Frame(outer, padding=18, relief="ridge")
+        box.place(relx=0.5, rely=0.5, anchor="center")
+
+        self._message_var = tk.StringVar(value="Carregando...")
+        ttk.Label(box, textvariable=self._message_var, font=("Segoe UI", 11, "bold")).pack(anchor="center")
+        self._pb = ttk.Progressbar(box, mode="indeterminate", length=220)
+        self._pb.pack(anchor="center", pady=(10, 0))
+
+        self.top = top
+        try:
+            self.parent.bind("<Configure>", self._on_parent_configure, add="+")
+            self.parent.bind("<Map>", self._on_parent_configure, add="+")
+        except Exception:
+            pass
+
+    def _on_parent_configure(self, event=None):
+        if self._visible:
+            self._sync_geometry()
+
+    def _sync_geometry(self):
+        try:
+            self.parent.update_idletasks()
+            w = max(1, int(self.parent.winfo_width() or 1))
+            h = max(1, int(self.parent.winfo_height() or 1))
+            x = int(self.parent.winfo_rootx() or 0)
+            y = int(self.parent.winfo_rooty() or 0)
+            self.top.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    def show(self, message: str = "Carregando..."):
+        if not self.parent.winfo_exists():
+            return
+        self._message_var.set(message or "Carregando...")
+        if self._visible:
+            self._sync_geometry()
+            try:
+                self.top.lift()
+                self.top.update_idletasks()
+            except Exception:
+                pass
+            return
+
+        self._prev_grab = None
+        try:
+            self._prev_grab = self.parent.grab_current()
+        except Exception:
+            self._prev_grab = None
+
+        try:
+            self.parent.configure(cursor="watch")
+        except Exception:
+            pass
+
+        self._sync_geometry()
+        try:
+            self.top.deiconify()
+            self.top.lift()
+        except Exception:
+            pass
+        try:
+            self.top.grab_set()
+        except Exception:
+            pass
+        try:
+            self._pb.start(10)
+        except Exception:
+            pass
+        try:
+            self.top.update_idletasks()
+        except Exception:
+            pass
+        self._visible = True
+
+    def hide(self):
+        if not self._visible:
+            return
+        try:
+            self._pb.stop()
+        except Exception:
+            pass
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        try:
+            self.top.withdraw()
+        except Exception:
+            pass
+        try:
+            self.parent.configure(cursor="")
+        except Exception:
+            pass
+        prev = self._prev_grab
+        self._prev_grab = None
+        if prev is not None:
+            try:
+                if prev.winfo_exists():
+                    prev.grab_set()
+            except Exception:
+                pass
+        self._visible = False
+
+
+def _ensure_busy_overlay(window: tk.Toplevel | tk.Tk) -> BusyOverlay:
+    overlay = getattr(window, "_busy_overlay", None)
+    if overlay is None:
+        overlay = BusyOverlay(window)
+        setattr(window, "_busy_overlay", overlay)
+    return overlay
+
+
+def run_with_busy(
+    window: tk.Toplevel | tk.Tk,
+    message: str,
+    work,
+    on_success,
+    on_error=None,
+):
+    overlay = _ensure_busy_overlay(window)
+    overlay.show(message)
+    cancelled = {"value": False}
+
+    def _finish_success(result):
+        if cancelled["value"] or not window.winfo_exists():
+            return
+        overlay.hide()
+        on_success(result)
+
+    def _finish_error(err: Exception):
+        if cancelled["value"] or not window.winfo_exists():
+            return
+        overlay.hide()
+        if on_error is not None:
+            on_error(err)
+        else:
+            messagebox.showerror(APP_TITLE, str(err), parent=window)
+
+    def _run():
+        try:
+            result = work()
+        except Exception as e:
+            try:
+                window.after(0, lambda: _finish_error(e))
+            except Exception:
+                cancelled["value"] = True
+            return
+        try:
+            window.after(0, lambda: _finish_success(result))
+        except Exception:
+            cancelled["value"] = True
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _pdf_escape(text: str) -> str:
     if not text:
         return ""
@@ -175,37 +799,67 @@ def build_text_pdf_bytes(ops: List[str]) -> bytes:
     return bytes(pdf)
 
 
-def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow") -> bytes:
-    # Coleta de dados
+def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow", include_pix_qrcode: bool = True) -> bytes:
+    def get_qr_matrix(data: str):
+        try:
+            import qrcode
+            qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=0)
+            qr.add_data(data)
+            qr.make(fit=True)
+            return qr.get_matrix()
+        except Exception:
+            import hashlib
+            size = 25
+            matrix = [[0 for _ in range(size)] for _ in range(size)]
+            for r in range(7):
+                for c in range(7):
+                    if r == 0 or r == 6 or c == 0 or c == 6 or (2 <= r <= 4 and 2 <= c <= 4):
+                        matrix[r][c] = 1
+                        matrix[size - 1 - r][c] = 1
+                        matrix[r][size - 1 - c] = 1
+            h = hashlib.md5(data.encode()).digest()
+            for i in range(len(h) * 8):
+                r = 8 + (i // (size - 8))
+                c = 8 + (i % (size - 8))
+                if r < size and c < size:
+                    if (h[i // 8] >> (i % 8)) & 1:
+                        matrix[r][c] = 1
+            return matrix
+
     bank_code = str(boleto_data.get("banco_codigo") or "000").strip()
-    bank_name = str(boleto_data.get("banco_nome") or boleto_data.get("portador_nome") or "").strip()
-    portador_name = str(boleto_data.get("portador_nome") or "").strip()
-    carteira = str(boleto_data.get("portador_carteira") or "").strip()
-    convenio = str(boleto_data.get("portador_convenio") or "").strip()
-    contrato = str(boleto_data.get("portador_contrato") or "").strip()
+    bank_name = str(boleto_data.get("banco_nome") or "BANCO").strip()
+    nosso_numero = str(boleto_data.get("nosso_numero") or "").strip()
+    documento = str(boleto_data.get("documento") or "").strip()
+    vencto = str(boleto_data.get("vencto_display") or "").strip()
+    valor = str(boleto_data.get("valor_display") or "0,00").strip()
+    linha_digitavel = str(boleto_data.get("linha_digitavel") or "").strip()
+    codigo_barra = str(boleto_data.get("codigo_barra") or "").strip()
+
+    cedente_nome = str(boleto_data.get("cedente_nome") or "").strip()
+    cedente_doc = str(boleto_data.get("cedente_documento") or "").strip()
+
+    sacado_nome = str(boleto_data.get("sacado_nome") or "").strip()
+    sacado_doc = str(boleto_data.get("sacado_inscricao") or "").strip()
+    sacado_end = str(boleto_data.get("sacado_endereco") or "").strip()
+    cidade_uf = str(boleto_data.get("sacado_cidade_uf") or "").strip()
+
     agencia = str(boleto_data.get("agencia") or "").strip()
     agencia_dv = str(boleto_data.get("agencia_digito") or "").strip()
     conta = str(boleto_data.get("nr_conta") or "").strip()
     conta_dv = str(boleto_data.get("conta_digito") or "").strip()
-    cedente_nome = str(boleto_data.get("cedente_nome") or invoice_row.company or "").strip()
-    cedente_doc = str(boleto_data.get("cedente_documento") or "").strip()
-    sacado_nome = str(boleto_data.get("sacado_nome") or invoice_row.customer_name or "").strip()
-    sacado_doc = str(boleto_data.get("sacado_inscricao") or "").strip()
-    sacado_end = str(boleto_data.get("sacado_endereco") or "").strip()
-    cidade_uf = str(boleto_data.get("sacado_cidade_uf") or "").strip()
-    documento = str(boleto_data.get("documento") or "").strip()
-    nosso_numero = str(boleto_data.get("nosso_numero") or "").strip()
-    linha_digitavel = str(boleto_data.get("linha_digitavel") or "").strip()
-    codigo_barra = str(boleto_data.get("codigo_barra") or "").strip()
-    vencto = str(boleto_data.get("vencto_display") or invoice_row.due_date_display()).strip()
-    valor = str(boleto_data.get("valor_display") or invoice_row.open_balance_display()).strip()
+    carteira = str(boleto_data.get("portador_carteira") or "").strip()
+
+    agencia_conta = f"{agencia}{'-'+agencia_dv if agencia_dv else ''} / {conta}{'-'+conta_dv if conta_dv else ''}"
     mensagem = str(boleto_data.get("mensagem") or "").strip()
-    
-    agencia_conta = f"{agencia}-{agencia_dv} / {conta}-{conta_dv}".replace("--", "-").strip(" /")
 
-    ops = []
+    pix_code = _pix_payload_for_boleto(boleto_data, invoice_row) if include_pix_qrcode else ""
 
-    def draw_text(x, y, text, size=9, bold=False):
+    ops: List[str] = []
+
+    def draw_text(x, y, text, size=9, bold=False, max_len=None):
+        text = str(text or "").strip()
+        if max_len and len(text) > max_len:
+            text = text[: max_len - 3] + "..."
         text = _pdf_escape(text)
         font = "/F2" if bold else "/F1"
         ops.append("BT")
@@ -224,136 +878,207 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
         ops.append(f"{x} {y} {w} {h} re")
         ops.append("f" if fill else "S")
 
-    # Margens e Posições
+    def wrap_text(text, max_chars):
+        if not text:
+            return []
+        lines = []
+        for p in text.split("\n"):
+            p = p.strip()
+            if not p:
+                lines.append("")
+                continue
+            while len(p) > max_chars:
+                idx = p.rfind(" ", 0, max_chars)
+                if idx == -1:
+                    idx = max_chars
+                lines.append(p[:idx].strip())
+                p = p[idx:].strip()
+            if p:
+                lines.append(p)
+        return lines
+
     left = 40
-    base_y = 380  # Começa na metade da página para a Ficha de Compensação
+    base_y = 350
     width = 515
-    
-    # --- CABEÇALHO (Recibo do Pagador) ---
-    draw_line(left, base_y + 420, left + width, base_y + 420, width=1) # Topo
-    draw_text(left, base_y + 405, "RECIBO DO PAGADOR", size=10, bold=True)
-    
-    curr_y = base_y + 380
-    draw_text(left, curr_y, f"Cedente: {cedente_nome}", size=9)
-    draw_text(left + 350, curr_y, f"CNPJ/CPF: {cedente_doc}", size=9)
-    
-    curr_y -= 15
-    draw_text(left, curr_y, f"Sacado: {sacado_nome}", size=9)
-    draw_text(left + 350, curr_y, f"Vencimento: {vencto}", size=9)
-    
-    curr_y -= 15
-    draw_text(left, curr_y, f"Nosso Número: {nosso_numero}", size=9)
-    draw_text(left + 350, curr_y, f"Valor: {valor}", size=9)
-    
-    draw_line(left, base_y + 340, left + width, base_y + 340, width=0.5) # Divisor
-    
-    # --- FICHA DE COMPENSAÇÃO (Layout Padrão) ---
+
+    draw_line(left, base_y + 450, left + width, base_y + 450, width=1)
+    draw_text(left, base_y + 435, "RECIBO DO PAGADOR", size=10, bold=True)
+
+    curr_y = base_y + 410
+    draw_text(left, curr_y, f"Cedente: {cedente_nome}", size=8)
+    draw_text(left + 350, curr_y, f"CNPJ/CPF: {cedente_doc}", size=8)
+
+    curr_y -= 12
+    draw_text(left, curr_y, f"Sacado: {sacado_nome}", size=8)
+    draw_text(left + 350, curr_y, f"Vencimento: {vencto}", size=8)
+
+    curr_y -= 12
+    draw_text(left, curr_y, f"Nosso Número: {nosso_numero}", size=8)
+    draw_text(left + 350, curr_y, f"Valor: {valor}", size=8)
+
+    draw_line(left, base_y + 370, left + width, base_y + 370, width=0.5)
+
     y = base_y
-    
-    # Linhas Horizontais Principais
-    draw_line(left, y + 250, left + width, y + 250, width=1.5) # Topo da ficha
-    draw_line(left, y + 225, left + width, y + 225, width=0.8)
+
+    draw_line(left, y + 250, left + width, y + 250, width=1.2)
+    draw_line(left, y + 230, left + width, y + 230, width=0.8)
     draw_line(left, y + 205, left + width, y + 205, width=0.8)
     draw_line(left, y + 185, left + width, y + 185, width=0.8)
     draw_line(left, y + 165, left + width, y + 165, width=0.8)
     draw_line(left, y + 145, left + width, y + 145, width=0.8)
-    draw_line(left, y + 65, left + width, y + 65, width=0.8) # Base do quadro principal
-    
-    # Linhas Verticais
-    draw_line(left + 60, y + 225, left + 60, y + 250, width=1) # Divisor banco
-    draw_line(left + 120, y + 225, left + 120, y + 250, width=1) # Divisor banco
-    draw_line(left + 380, y + 65, left + 380, y + 225, width=0.8) # Coluna da direita (valores)
-    
-    # Textos do Cabeçalho da Ficha
-    draw_text(left + 15, y + 232, bank_code, size=15, bold=True)
-    draw_text(left + 125, y + 232, bank_name[:25], size=11, bold=True)
-    # Linha Digitável alinhada à direita com fonte um pouco menor para caber
-    draw_text(left + 235, y + 232, linha_digitavel, size=9, bold=True)
-    
-    # Linha 1: Local de Pagamento e Vencimento
-    draw_text(left + 5, y + 217, "Local de Pagamento", size=6)
-    draw_text(left + 5, y + 208, "QUALQUER BANCO ATÉ O VENCIMENTO", size=8)
-    draw_text(left + 385, y + 217, "Vencimento", size=6)
-    draw_text(left + 385, y + 208, vencto, size=9, bold=True)
-    
-    # Linha 2: Cedente e Agência/Código Cedente
-    draw_text(left + 5, y + 197, "Cedente", size=6)
-    draw_text(left + 5, y + 188, cedente_nome, size=8)
-    draw_text(left + 385, y + 197, "Agência/Código Cedente", size=6)
-    draw_text(left + 385, y + 188, agencia_conta, size=9)
-    
-    # Linha 3: Datas e Nosso Número
-    draw_text(left + 5, y + 177, "Data do Documento", size=6)
-    draw_text(left + 5, y + 168, date.today().strftime("%d/%m/%Y"), size=8)
-    draw_text(left + 100, y + 177, "Nº do Documento", size=6)
-    draw_text(left + 100, y + 168, documento, size=8)
-    draw_text(left + 200, y + 177, "Espécie Doc.", size=6)
-    draw_text(left + 200, y + 168, "DM", size=8)
-    draw_text(left + 250, y + 177, "Aceite", size=6)
-    draw_text(left + 250, y + 168, "N", size=8)
-    draw_text(left + 300, y + 177, "Data Proc.", size=6)
-    draw_text(left + 300, y + 168, date.today().strftime("%d/%m/%Y"), size=8)
-    draw_text(left + 385, y + 177, "Nosso Número", size=6)
-    draw_text(left + 385, y + 168, nosso_numero, size=9)
-    
-    # Linha 4: Uso do Banco, Carteira, etc e Valor
-    draw_text(left + 5, y + 157, "Uso do Banco", size=6)
-    draw_text(left + 100, y + 157, "Carteira", size=6)
-    draw_text(left + 100, y + 148, carteira, size=8)
-    draw_text(left + 150, y + 157, "Espécie", size=6)
-    draw_text(left + 150, y + 148, "R$", size=8)
-    draw_text(left + 200, y + 157, "Quantidade", size=6)
-    draw_text(left + 300, y + 157, "Valor", size=6)
-    draw_text(left + 385, y + 157, "(=) Valor do Documento", size=6)
-    draw_text(left + 385, y + 148, valor, size=9, bold=True)
-    
-    # Campo de Instruções
-    draw_text(left + 5, y + 137, "Instruções", size=6)
+    draw_line(left, y + 85, left + width, y + 85, width=0.8)
+
+    draw_line(left + 230, y + 250, left + 230, y + 275, width=1.0)
+    draw_line(left + 280, y + 250, left + 280, y + 275, width=1.0)
+    draw_line(left + 380, y + 85, left + 380, y + 250, width=0.8)
+
+    draw_line(left + 90, y + 185, left + 90, y + 205, width=0.8)
+    draw_line(left + 190, y + 185, left + 190, y + 205, width=0.8)
+    draw_line(left + 240, y + 185, left + 240, y + 205, width=0.8)
+    draw_line(left + 280, y + 185, left + 280, y + 205, width=0.8)
+
+    draw_line(left + 120, y + 165, left + 120, y + 185, width=0.8)
+    draw_line(left + 180, y + 165, left + 180, y + 185, width=0.8)
+    draw_line(left + 240, y + 165, left + 240, y + 185, width=0.8)
+
+    for i in range(1, 6):
+        draw_line(left + 380, y + 145 - (i * 12), left + width, y + 145 - (i * 12), width=0.5)
+
+    bank_dvs = {"001": "9", "237": "2", "341": "7", "104": "0", "033": "7", "748": "X", "756": "0", "041": "8"}
+    bank_dv = bank_dvs.get(bank_code, "9")
+
+    b_size = 9
+    if len(bank_name) > 35:
+        b_size = 8
+    if len(bank_name) > 45:
+        b_size = 7
+    draw_text(left + 5, y + 260, bank_name, size=b_size, bold=True)
+    draw_text(left + 235, y + 260, f"{bank_code}-{bank_dv}", size=12, bold=True)
+    draw_text(left + 285, y + 260, linha_digitavel, size=8.2, bold=True)
+
+    draw_text(left + 5, y + 242, "Local de Pagamento", size=6)
+    draw_text(left + 5, y + 233, "PAGÁVEL EM QUALQUER BANCO ATÉ O VENCIMENTO", size=8)
+    draw_text(left + 385, y + 242, "Vencimento", size=6)
+    draw_text(left + 385, y + 233, vencto, size=10, bold=True)
+
+    draw_text(left + 5, y + 222, "Beneficiário", size=6)
+    beneficiario_lines = wrap_text(f"{cedente_nome} - CNPJ: {cedente_doc}", 75)
+    for i, bline in enumerate(beneficiario_lines[:2]):
+        draw_text(left + 5, y + 213 - (i * 9), bline, size=8, bold=True)
+    draw_text(left + 385, y + 222, "Agência / Código Beneficiário", size=6)
+    draw_text(left + 385, y + 213, agencia_conta, size=9)
+
+    draw_text(left + 5, y + 197, "Data do Documento", size=6)
+    draw_text(left + 5, y + 188, date.today().strftime("%d/%m/%Y"), size=8)
+    draw_text(left + 95, y + 197, "Nº do Documento", size=6)
+    draw_text(left + 95, y + 188, documento, size=8)
+    draw_text(left + 195, y + 197, "Espécie Doc.", size=6)
+    draw_text(left + 195, y + 188, "DM", size=8)
+    draw_text(left + 245, y + 197, "Aceite", size=6)
+    draw_text(left + 245, y + 188, "N", size=8)
+    draw_text(left + 285, y + 197, "Data Proc.", size=6)
+    draw_text(left + 285, y + 188, date.today().strftime("%d/%m/%Y"), size=8)
+    draw_text(left + 385, y + 197, "Nosso Número", size=6)
+    draw_text(left + 385, y + 188, nosso_numero, size=9)
+
+    draw_text(left + 5, y + 177, "Uso do Banco", size=6)
+    draw_text(left + 125, y + 177, "Carteira", size=6)
+    draw_text(left + 125, y + 168, carteira, size=8)
+    draw_text(left + 185, y + 177, "Espécie", size=6)
+    draw_text(left + 185, y + 168, "R$", size=8)
+    draw_text(left + 245, y + 177, "Quantidade", size=6)
+    draw_text(left + 385, y + 177, "(=) Valor do Documento", size=6)
+    draw_text(left + 385, y + 168, valor, size=10, bold=True)
+
+    draw_text(left + 5, y + 157, "Instruções / Observações", size=6)
+    max_instr_chars = 45 if pix_code else 75
     if mensagem:
-        msg_lines = mensagem.split("\n")
-        for i, mline in enumerate(msg_lines[:4]):
-            draw_text(left + 5, y + 125 - (i * 10), mline[:80], size=8)
-            
-    # Sacado
-    draw_rect(left, y + 20, width, 40)
-    draw_text(left + 5, y + 52, "Sacado", size=6)
-    draw_text(left + 45, y + 52, f"{sacado_nome} - {sacado_doc}", size=8, bold=True)
-    draw_text(left + 45, y + 42, sacado_end, size=8)
-    draw_text(left + 45, y + 32, cidade_uf, size=8)
-    
-    # --- CÓDIGO DE BARRAS (I25) ---
+        wrapped_lines = wrap_text(mensagem, max_instr_chars)
+        for i, mline in enumerate(wrapped_lines[:6]):
+            draw_text(left + 5, y + 130 - (i * 9), mline, size=8)
+
+    draw_text(left + 385, y + 137, "(-) Descontos / Abatimentos", size=6)
+    draw_text(left + 385, y + 125, "(+) Mora / Multa", size=6)
+    draw_text(left + 385, y + 113, "(+) Outros Acréscimos", size=6)
+    draw_text(left + 385, y + 101, "(=) Valor Cobrado", size=6)
+    draw_text(left + 385, y + 88, valor, size=9, bold=True)
+
+    if pix_code:
+        qr_size = 50
+        qr_x = left + 280
+        qr_y = y + 95
+        matrix = get_qr_matrix(pix_code)
+        m_size = len(matrix)
+        mod_size = qr_size / m_size
+        for row_idx, row_data in enumerate(matrix):
+            for col_idx, val in enumerate(row_data):
+                if val:
+                    draw_rect(
+                        qr_x + (col_idx * mod_size),
+                        qr_y + qr_size - ((row_idx + 1) * mod_size),
+                        mod_size,
+                        mod_size,
+                        fill=True,
+                    )
+        draw_rect(qr_x, qr_y, qr_size, qr_size)
+        draw_text(qr_x, qr_y - 8, "PAGUE COM PIX", size=6, bold=True)
+        draw_text(left + 5, y + 80, "PIX Copia e Cola:", size=5, bold=True)
+        draw_text(left + 70, y + 80, pix_code, size=4.5)
+
+    draw_rect(left, y + 15, width, 55)
+    draw_text(left + 5, y + 62, "Pagador", size=6)
+
+    sacado_lines = wrap_text(f"{sacado_nome} - {sacado_doc}", 75)
+    for i, sline in enumerate(sacado_lines[:2]):
+        draw_text(left + 45, y + 62 - (i * 9), sline, size=8, bold=True)
+    draw_text(left + 45, y + 43, sacado_end, size=8)
+    draw_text(left + 45, y + 34, cidade_uf, size=8)
+    draw_text(left + 5, y + 17, "Sacador / Avalista", size=6)
+
     if codigo_barra and codigo_barra.isdigit() and len(codigo_barra) == 44:
-        # Lógica Intercalado 2 de 5
-        # 0: narrow, 1: wide
         patterns = {
-            '0': '00110', '1': '10001', '2': '01001', '3': '11000', '4': '00101',
-            '5': '10100', '6': '01100', '7': '00011', '8': '10010', '9': '01010'
+            "0": "00110",
+            "1": "10001",
+            "2": "01001",
+            "3": "11000",
+            "4": "00101",
+            "5": "10100",
+            "6": "01100",
+            "7": "00011",
+            "8": "10010",
+            "9": "01010",
         }
-        
-        start_pattern = "0000" # n n n n
-        stop_pattern = "100"  # w n n
-        
+
+        start_pattern = "0000"
+        stop_pattern = "100"
+
         full_pattern = start_pattern
         for i in range(0, 44, 2):
             p1 = patterns[codigo_barra[i]]
-            p2 = patterns[codigo_barra[i+1]]
+            p2 = patterns[codigo_barra[i + 1]]
             for j in range(5):
                 full_pattern += p1[j] + p2[j]
         full_pattern += stop_pattern
-        
-        # Desenha as barras
+
         bx = left
-        by = y - 30
-        bw_narrow = 0.75
-        bw_wide = 2.1
-        bh = 40
-        
+        bh = 50
+        footer_text = "AUTENTICAÇÃO MECÂNICA - FICHA DE COMPENSAÇÃO"
+        footer_size = 5.5
+        footer_step = footer_size + 2.5
+        footer_top = (y + 11)
+        by = (footer_top - 2) - bh
+        units_total = sum(3 if b == "1" else 1 for b in full_pattern)
+        bw_fit = (width / units_total) if units_total else 0.75
+        bw_narrow = max(0.75, min(bw_fit, 1.15))
+        bw_wide = bw_narrow * 3
+
         for i, bit in enumerate(full_pattern):
             is_bar = (i % 2 == 0)
-            bw = bw_wide if bit == '1' else bw_narrow
+            bw = bw_wide if bit == "1" else bw_narrow
             if is_bar:
                 draw_rect(bx, by, bw, bh, fill=True)
             bx += bw
+        draw_text(left, by - footer_step, footer_text, size=footer_size, bold=False)
 
     return build_text_pdf_bytes(ops)
 
@@ -449,6 +1174,7 @@ class ConfigWindow(SimpleDialog):
             ("Servidor SMTP", "smtp_host"),
             ("Senha", "smtp_password"),
             ("Porta", "smtp_port"),
+            ("Espaçamento (seg)", "smtp_delay_seconds"),
         ]
         for i, (label, key) in enumerate(smtp_fields):
             ttk.Label(smtp_form, text=label).grid(row=i, column=0, sticky="w", padx=(0, 8), pady=5)
@@ -485,11 +1211,22 @@ class ConfigWindow(SimpleDialog):
         else:
             smtp_port = 587
 
+        smtp_delay_raw = self.entries.get("smtp_delay_seconds").get().strip() if self.entries.get("smtp_delay_seconds") else ""
+        if smtp_delay_raw:
+            try:
+                smtp_delay = int(smtp_delay_raw)
+            except Exception:
+                raise AppError("O espaçamento SMTP deve ser numérico.")
+        else:
+            smtp_delay = 5
+        smtp_delay = max(0, min(300, smtp_delay))
+
         cfg["smtp"] = {
             "email": self.entries["smtp_email"].get().strip(),
             "host": self.entries["smtp_host"].get().strip(),
             "password": self.entries["smtp_password"].get().strip(),
             "port": smtp_port,
+            "delay_seconds": smtp_delay,
         }
 
         if not cfg["connection"]["host"]:
@@ -503,10 +1240,21 @@ class ConfigWindow(SimpleDialog):
     def _test(self):
         try:
             cfg = self._collect()
-            Database(cfg).test_connection()
-            messagebox.showinfo(APP_TITLE, "Conexão realizada com sucesso.", parent=self)
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Falha ao testar conexão:\n\n{e}", parent=self)
+            return
+
+        def _work():
+            Database(cfg).test_connection()
+            return True
+
+        def _ok(_):
+            messagebox.showinfo(APP_TITLE, "Conexão realizada com sucesso.", parent=self)
+
+        def _err(e: Exception):
+            messagebox.showerror(APP_TITLE, f"Falha ao testar conexão:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Testando conexão...", _work, _ok, _err)
 
     def _save(self):
         try:
@@ -525,77 +1273,208 @@ class EmailComposeWindow(SimpleDialog):
         self.current_user = current_user
         self.invoice_row = invoice_row
         self.customer_email = customer_email or ""
-        self.boleto_data: Dict[str, Any] = {}
+        self.boleto_data: Dict[str, Any] = {"exists": False, "email_note": "Observação: consultando dados do boleto."}
+        self.purchase_map: Dict[Any, Dict[str, Any]] = {}
+        self.purchase_error: str = ""
         self.attachment_bytes = None
         self.attachment_name = ""
-        self.boleto_status_text = "Boleto ainda não gerado"
-        self._prepare_boleto_attachment()
+        self.boleto_status_text = "Consultando boleto..."
+        self.boleto_status_var = tk.StringVar(value=f"Status do boleto: {self.boleto_status_text}")
+        self.send_pix_qrcode_var = tk.BooleanVar(value=False)
         super().__init__(master, "Enviar fatura por e-mail", "760x680")
         self._build()
+        self._load_email_data()
 
-    def _prepare_boleto_attachment(self):
-        try:
-            payload = Database(self.config_data).get_boleto_email_payload(self.invoice_row.invoice_id)
-        except Exception as e:
+    def _load_email_data(self):
+        def _work():
+            db = Database(self.config_data)
+            payload = db.get_boleto_email_payload(self.invoice_row.invoice_id)
+            try:
+                inv_key = getattr(self.invoice_row, "movto_id", None) if getattr(self.invoice_row, "movto_id", None) not in (None, "", 0, "0") else self.invoice_row.invoice_id
+                purchase_map = db.get_purchase_info_bulk([inv_key])
+                purchase_error = ""
+            except Exception as e:
+                purchase_map = {}
+                purchase_error = str(e) or "Falha ao consultar itens da venda."
+                if len(purchase_error) > 220:
+                    purchase_error = purchase_error[:220] + "..."
+            return payload, purchase_map, purchase_error
+
+        def _ok(result):
+            payload, purchase_map, purchase_error = result
+            self.purchase_map = purchase_map or {}
+            self.purchase_error = "" if self.purchase_map else str(purchase_error or "").strip()
+            self._apply_boleto_payload(payload)
+            self._maybe_refresh_default_body()
+            try:
+                self.send_btn.state(["!disabled"])
+            except Exception:
+                pass
+
+        def _err(e: Exception):
             payload = {
                 "exists": False,
                 "email_note": f"Observação: não foi possível consultar os dados do boleto neste momento. {e}",
             }
+            self._apply_boleto_payload(payload)
+            self._maybe_refresh_default_body()
+            try:
+                self.send_btn.state(["!disabled"])
+            except Exception:
+                pass
 
+        try:
+            self.send_btn.state(["disabled"])
+        except Exception:
+            pass
+        run_with_busy(self, "Consultando dados do boleto...", _work, _ok, _err)
+
+    def _apply_boleto_payload(self, payload: Dict[str, Any]):
         self.boleto_data = payload or {}
         if not self.boleto_data.get("exists"):
             self.boleto_status_text = "Boleto ainda não gerado"
+            self.attachment_bytes = None
+            self.attachment_name = ""
+            self.boleto_status_var.set(f"Status do boleto: {self.boleto_status_text}")
             return
 
-        attachment_data = self.boleto_data.get("attachment_data")
         filename = self.boleto_data.get("filename") or f"boleto_{self.invoice_row.invoice_id}.pdf"
-        if attachment_data:
-            self.attachment_bytes = attachment_data
-            self.attachment_name = filename
-            self.boleto_status_text = "Boleto localizado e anexado"
-            return
+        self.attachment_bytes = None
+        self.attachment_name = filename
+        self.boleto_status_text = "Boleto localizado (será gerado para o envio)"
+        self.boleto_status_var.set(f"Status do boleto: {self.boleto_status_text}")
 
+    def _maybe_refresh_default_body(self):
         try:
-            generated = build_boleto_pdf_bytes(self.boleto_data, self.invoice_row)
-            self.attachment_bytes = generated
-            self.attachment_name = filename
-            self.boleto_status_text = "Boleto gerado pelo app e anexado"
+            current = (self.body_text.get("1.0", "end") or "").strip()
         except Exception:
-            self.boleto_status_text = "Boleto localizado, mas sem anexo automático"
+            return
+        new_body = self._default_body()
+        if current == (self._default_body_snapshot or "").strip():
+            self.body_text.delete("1.0", "end")
+            self.body_text.insert("1.0", new_body)
+            self._default_body_snapshot = new_body
 
     def _default_subject(self) -> str:
         due_text = self.invoice_row.due_date_display()
         return f"Fatura a receber - {self.invoice_row.customer_name} - vencimento {due_text}"
 
     def _default_body(self) -> str:
-        company = self.invoice_row.company or ""
+        company = str(self.invoice_row.company or "").strip()
         account_display = (f"{self.invoice_row.account_code or ''} - {self.invoice_row.account_name or ''}").strip(" -")
         note = str(self.boleto_data.get("email_note", "") or "").strip()
         if not note:
             if self.boleto_data.get("exists"):
-                if self.attachment_bytes:
-                    note = "Observação: o boleto segue em anexo."
+                if getattr(self, "attachment_bytes", None):
+                    note = "Observação: o boleto foi localizado e segue em anexo (PDF)."
                 else:
-                    note = "Observação: foi localizado um boleto, mas não foi possível anexá-lo automaticamente."
+                    note = "Observação: o boleto foi localizado e será gerado em PDF pelo app para envio em anexo."
             else:
                 note = "Observação: o boleto ainda não foi gerado."
+                
+        invoice_id = str(getattr(self.invoice_row, "invoice_id", "") or "").strip()
+        doc_str = invoice_id if invoice_id else "N/A"
+        
+        purchase_text, _ = build_purchase_info_blocks(self.invoice_row, self.purchase_map)
+        purchase_err = str(getattr(self, "purchase_error", "") or "").strip()
+        if purchase_err and not purchase_text:
+            purchase_text = f"\nInformações da compra:\n- Não foi possível consultar itens da venda: {purchase_err}\n\n"
         return (
             f"Prezado(a),\n\n"
-            f"Segue abaixo os dados da fatura para conferência e programação do pagamento.\n\n"
-            f"Empresa: {company}\n"
+            f"Segue a fatura para conferência e programação do pagamento.\n\n"
             f"Cliente: {self.invoice_row.customer_name}\n"
-            f"Código do cliente: {self.invoice_row.customer_code}\n"
             f"Conta: {account_display}\n"
-            f"Emissão: {self.invoice_row.issue_date_display()}\n"
-            f"Vencimento: {self.invoice_row.due_date_display()}\n"
-            f"Valor original: {self.invoice_row.amount_display()}\n"
-            f"Desconto: {self.invoice_row.discount_amount_display()}\n"
-            f"Saldo em aberto: {self.invoice_row.open_balance_display()}\n\n"
+            f"Total a pagar: {self.invoice_row.open_balance_display()}\n\n"
+            f"- Documento / Fatura: {doc_str} | Emissão: {self.invoice_row.issue_date_display()} | Venc.: {self.invoice_row.due_date_display()} | Saldo: {self.invoice_row.open_balance_display()}\n\n"
+            f"{purchase_text}"
             f"{note}\n\n"
             f"Em caso de dúvidas, ficamos à disposição.\n\n"
             f"Atenciosamente,\n"
             f"{company}"
         )
+
+    def _default_body_html(self) -> str:
+        company = str(self.invoice_row.company or "").strip()
+        account_display = (f"{self.invoice_row.account_code or ''} - {self.invoice_row.account_name or ''}").strip(" -")
+        note = str(self.boleto_data.get("email_note", "") or "").strip()
+        
+        note_bg = "#fff7ed"
+        note_border = "#fed7aa"
+        note_color = "#9a3412"
+        
+        if not note:
+            if self.boleto_data.get("exists"):
+                if getattr(self, "attachment_bytes", None):
+                    note = "<b>Observação:</b> o boleto foi localizado e segue em anexo (PDF)."
+                    note_bg = "#ecfdf5"
+                    note_border = "#a7f3d0"
+                    note_color = "#065f46"
+                else:
+                    note = "<b>Observação:</b> o boleto foi localizado e será gerado em PDF pelo app para envio em anexo."
+                    note_bg = "#ecfdf5"
+                    note_border = "#a7f3d0"
+                    note_color = "#065f46"
+            else:
+                note = "<b>Observação:</b> o boleto ainda não foi gerado."
+        else:
+            note = html.escape(note)
+            
+        html_note = f"<div class='note'>{note}</div>"
+        _, purchase_html = build_purchase_info_blocks(self.invoice_row, self.purchase_map)
+        purchase_err = str(getattr(self, "purchase_error", "") or "").strip()
+        if purchase_err and not purchase_html:
+            purchase_html = f"<h3>Informações da compra</h3><div class='note'><b>Observação:</b> Não foi possível consultar itens da venda: {html.escape(purchase_err)}</div>"
+
+        invoice_id = str(getattr(self.invoice_row, "invoice_id", "") or "").strip()
+        doc_str = invoice_id if invoice_id else "N/A"
+
+        return f"""<html>
+<head>
+<style>
+    body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
+    .card {{ max-width: 780px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #ffffff; }}
+    .title {{ font-size: 18px; font-weight: 700; color: #2563eb; margin: 0 0 10px 0; }}
+    .muted {{ color: #6b7280; margin: 0 0 14px 0; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 12px; }}
+    th {{ background-color: #f8fafc; text-align: left; padding: 10px; border: 1px solid #e5e7eb; }}
+    td {{ padding: 10px; border: 1px solid #e5e7eb; }}
+    .note {{ margin: 12px 0 12px 0; padding: 10px 12px; background: {note_bg}; border: 1px solid {note_border}; border-radius: 8px; color: {note_color}; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="title">Fatura para programação de pagamento</p>
+    <p class="muted">Cliente: <b>{html.escape(self.invoice_row.customer_name)}</b> &nbsp;|&nbsp; Conta: <b>{html.escape(account_display)}</b></p>
+    <p><b>Total a pagar:</b> {html.escape(self.invoice_row.open_balance_display())}</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Documento / Fatura</th>
+          <th>Emissão</th>
+          <th>Vencimento</th>
+          <th>Valor Original</th>
+          <th>Desconto</th>
+          <th>Saldo a Pagar</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>{html.escape(doc_str)}</td>
+          <td>{html.escape(self.invoice_row.issue_date_display())}</td>
+          <td>{html.escape(self.invoice_row.due_date_display())}</td>
+          <td>{html.escape(self.invoice_row.amount_display())}</td>
+          <td>{html.escape(self.invoice_row.discount_amount_display())}</td>
+          <td>{html.escape(self.invoice_row.open_balance_display())}</td>
+        </tr>
+      </tbody>
+    </table>
+    {purchase_html}
+    {html_note}
+    <p>Em caso de dúvidas, ficamos à disposição.</p>
+    <p>Atenciosamente,<br>{html.escape(company)}</p>
+  </div>
+</body>
+</html>"""
 
     def _build(self):
         frm = ttk.Frame(self, padding=16)
@@ -606,7 +1485,8 @@ class EmailComposeWindow(SimpleDialog):
         ttk.Label(info, text=f"Cliente: {self.invoice_row.customer_name}").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Label(info, text=f"Vencimento: {self.invoice_row.due_date_display()}").grid(row=1, column=0, sticky="w", pady=2)
         ttk.Label(info, text=f"Saldo em aberto: {self.invoice_row.open_balance_display()}").grid(row=2, column=0, sticky="w", pady=2)
-        ttk.Label(info, text=f"Status do boleto: {self.boleto_status_text}").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(info, textvariable=self.boleto_status_var).grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(info, text="Incluir QRCode PIX no boleto (PDF)", variable=self.send_pix_qrcode_var).grid(row=4, column=0, sticky="w", pady=(6, 2))
 
         form = ttk.Frame(frm)
         form.pack(fill="x", pady=(0, 10))
@@ -621,12 +1501,15 @@ class EmailComposeWindow(SimpleDialog):
         ttk.Label(frm, text="Mensagem").pack(anchor="w")
         self.body_text = tk.Text(frm, wrap="word", height=18)
         self.body_text.pack(fill="both", expand=True, pady=(4, 0))
-        self.body_text.insert("1.0", self._default_body())
+        default_body = self._default_body()
+        self._default_body_snapshot = default_body
+        self.body_text.insert("1.0", default_body)
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(12, 0))
         ttk.Button(btns, text="Cancelar", command=self.destroy).pack(side="right")
-        ttk.Button(btns, text="Enviar", command=self._send_email).pack(side="right", padx=(0, 8))
+        self.send_btn = ttk.Button(btns, text="Enviar", command=self._send_email)
+        self.send_btn.pack(side="right", padx=(0, 8))
 
     def _send_email(self):
         to_email = self.to_var.get().strip()
@@ -657,13 +1540,74 @@ class EmailComposeWindow(SimpleDialog):
         msg["Subject"] = subject
         msg.set_content(body)
 
-        if self.attachment_bytes:
-            msg.add_attachment(
-                self.attachment_bytes,
-                maintype="application",
-                subtype="pdf",
-                filename=self.attachment_name or f"boleto_{self.invoice_row.invoice_id}.pdf",
-            )
+        if body.strip() == str(getattr(self, "_default_body_snapshot", "") or "").strip():
+            msg.add_alternative(self._default_body_html(), subtype="html")
+        else:
+            chunks = re.split(r"\n\s*\n", body.strip())
+            html_parts = []
+            for c in chunks:
+                c = c.strip()
+                if not c:
+                    continue
+                html_parts.append(f"<p>{html.escape(c).replace(chr(10), '<br>')}</p>")
+            html_body = f"""<html>
+<head>
+<style>
+    body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
+</style>
+</head>
+<body>
+{''.join(html_parts)}
+</body>
+</html>"""
+            msg.add_alternative(html_body, subtype="html")
+
+        include_pix_qrcode = bool(self.send_pix_qrcode_var.get())
+        pdf_bytes = None
+        if (self.boleto_data or {}).get("exists"):
+            if include_pix_qrcode:
+                attachment_data = (self.boleto_data or {}).get("attachment_data")
+                if attachment_data:
+                    try:
+                        pdf_bytes = bytes(attachment_data)
+                    except Exception:
+                        pdf_bytes = None
+            if not pdf_bytes:
+                try:
+                    pdf_bytes = build_boleto_pdf_bytes(self.boleto_data or {}, self.invoice_row, include_pix_qrcode=include_pix_qrcode)
+                except Exception:
+                    pdf_bytes = None
+                    if include_pix_qrcode:
+                        attachment_data = (self.boleto_data or {}).get("attachment_data")
+                        if attachment_data:
+                            try:
+                                pdf_bytes = bytes(attachment_data)
+                            except Exception:
+                                pdf_bytes = None
+        else:
+            pdf_bytes = self.attachment_bytes
+
+        if pdf_bytes:
+            msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=self.attachment_name or f"boleto_{self.invoice_row.invoice_id}.pdf")
+
+        try:
+            sig = Database(self.config_data).get_sale_signature_pdf(getattr(self.invoice_row, "invoice_id", None))
+        except Exception:
+            sig = {}
+        sig_added = False
+        for a in ((sig or {}).get("attachments") or []):
+            data = a.get("data")
+            name = a.get("filename")
+            if not data or not name:
+                continue
+            maintype, subtype = _mime_parts_from_filename(name)
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+            sig_added = True
+        sig_bytes = (sig or {}).get("attachment_data")
+        if not sig_added and (sig or {}).get("exists") and sig_bytes:
+            name = (sig or {}).get("filename") or f"assinatura_{getattr(self.invoice_row, 'invoice_id', None) or ''}"
+            maintype, subtype = _mime_parts_from_filename(name)
+            msg.add_attachment(sig_bytes, maintype=maintype, subtype=subtype, filename=name)
 
         try:
             if smtp_port == 465:
@@ -684,7 +1628,7 @@ class EmailComposeWindow(SimpleDialog):
             AuditLogger.write(
                 self.current_user,
                 "enviar_email_fatura",
-                f"cliente={self.invoice_row.customer_name};para={to_email};invoice={self.invoice_row.invoice_id};anexo_pdf={'sim' if self.attachment_bytes else 'nao'}"
+                f"cliente={self.invoice_row.customer_name};para={to_email};invoice={self.invoice_row.invoice_id};anexo_pdf={'sim' if pdf_bytes else 'nao'};pix_incluido_no_boleto={'sim' if include_pix_qrcode else 'nao'}"
             )
             messagebox.showinfo(APP_TITLE, "E-mail enviado com sucesso.", parent=self)
             self.destroy()
@@ -911,9 +1855,9 @@ class InactiveCustomersWindow(tk.Toplevel):
         self.sort_reverse = False
         self.status_var = tk.StringVar(value="Pronto.")
         self.title(f"{APP_TITLE} - Clientes inativos")
-        self.geometry("1360x720")
-        self.minsize(1260, 680)
-        self.transient(master)
+        self.geometry("1500x780")
+        self.minsize(1320, 700)
+        self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._setup_style()
         self._build_ui()
@@ -938,23 +1882,27 @@ class InactiveCustomersWindow(tk.Toplevel):
     def _build_ui(self):
         top = ttk.Frame(self, padding=(12, 12, 12, 8))
         top.pack(fill="x")
-        left_actions = ttk.Frame(top)
+        row1 = ttk.Frame(top)
+        row1.pack(fill="x")
+        left_actions = ttk.Frame(row1)
         left_actions.pack(side="left")
         ttk.Button(left_actions, text="Atualizar lista", command=self.load_data).pack(side="left")
         ttk.Button(left_actions, text="Marcar todos", command=self.mark_all).pack(side="left", padx=(8, 0))
         ttk.Button(left_actions, text="Desmarcar todos", command=self.unmark_all).pack(side="left", padx=(8, 0))
         ttk.Button(left_actions, text="Voltar ao início", command=self._close).pack(side="left", padx=(16, 0))
-        filter_box = ttk.Frame(top)
-        filter_box.pack(side="left", padx=(18, 0))
-        ttk.Label(filter_box, text="Mostrar:").pack(side="left", padx=(0, 6))
-        filtro = ttk.Combobox(filter_box, textvariable=self.filter_var, values=list(self.FILTER_OPTIONS.keys()), state="readonly", width=12)
-        filtro.pack(side="left")
-        filtro.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
-        actions = ttk.Frame(top)
+        actions = ttk.Frame(row1)
         actions.pack(side="right")
         ttk.Button(actions, text="Inativar cliente", command=lambda: self.run_action("inactivate_customer_sql", "Inativar cliente", "Inativo")).pack(side="left")
         ttk.Button(actions, text="Excluir cliente", command=lambda: self.run_action("delete_customer_sql", "Excluir cliente", "Deletado")).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Inativar vendas a prazo", command=lambda: self.run_action("disable_credit_sql", "Inativar vendas a prazo", None)).pack(side="left", padx=(8, 0))
+        row2 = ttk.Frame(top)
+        row2.pack(fill="x", pady=(8, 0))
+        filter_box = ttk.Frame(row2)
+        filter_box.pack(side="left")
+        ttk.Label(filter_box, text="Mostrar:").pack(side="left", padx=(0, 6))
+        filtro = ttk.Combobox(filter_box, textvariable=self.filter_var, values=list(self.FILTER_OPTIONS.keys()), state="readonly", width=12)
+        filtro.pack(side="left")
+        filtro.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
         middle = ttk.Frame(self, padding=(12, 0, 12, 0))
         middle.pack(fill="both", expand=True)
         columns = ("company", "code", "name", "account", "credit_limit", "last_date", "status")
@@ -1066,9 +2014,12 @@ class InactiveCustomersWindow(tk.Toplevel):
                 suffix = " ▼" if self.sort_reverse else " ▲"
             self.tree.heading(col, text=label + suffix, command=lambda c=col: self.sort_by(c))
     def load_data(self):
-        try:
-            self.set_status("Conectando ao banco e carregando clientes.")
-            data = Database(self.config_data).list_inactive_customers()
+        self.set_status("Conectando ao banco e carregando clientes.")
+
+        def _work():
+            return Database(self.config_data).list_inactive_customers()
+
+        def _ok(data):
             self.rows = [
                 CustomerRow(
                     customer_id=row.get("customer_id"),
@@ -1082,15 +2033,18 @@ class InactiveCustomersWindow(tk.Toplevel):
                     credit_limit=row.get("credit_limit"),
                     selected=False,
                 )
-                for row in data
+                for row in (data or [])
             ]
             self.apply_filter()
             self.set_status(f"{len(self.filtered_rows)} cliente(s) encontrado(s).")
             AuditLogger.write(self.current_user, "carregar_lista", f"tipo=clientes_inativos;quantidade={len(self.filtered_rows)}")
-        except Exception as e:
+
+        def _err(e: Exception):
             self.set_status("Falha ao carregar dados.")
             messagebox.showerror(APP_TITLE, f"Erro ao carregar clientes:\n\n{e}", parent=self)
             AuditLogger.write(self.current_user, "erro_carregar_lista", f"tipo=clientes_inativos;erro={e}")
+
+        run_with_busy(self, "Carregando clientes...", _work, _ok, _err)
     def apply_filter(self):
         selected_filter = self.FILTER_OPTIONS.get(self.filter_var.get())
         if selected_filter is None:
@@ -1154,9 +2108,12 @@ class InactiveCustomersWindow(tk.Toplevel):
             return
         if not messagebox.askyesno(APP_TITLE, f"Deseja executar a ação '{action_name}' para {len(selected)} cliente(s)?", parent=self):
             return
-        try:
-            customer_ids = [r.customer_id for r in selected]
-            affected = Database(self.config_data).execute_action(sql_text, customer_ids)
+        customer_ids = [r.customer_id for r in selected]
+
+        def _work():
+            return Database(self.config_data).execute_action(sql_text, customer_ids)
+
+        def _ok(affected):
             if new_status:
                 for row in selected:
                     row.customer_status = new_status
@@ -1166,9 +2123,12 @@ class InactiveCustomersWindow(tk.Toplevel):
             AuditLogger.write(self.current_user, "acao_operacional", f"acao={action_name};selecionados={len(selected)};afetados={affected}")
             self.load_data()
             messagebox.showinfo(APP_TITLE, f"Ação '{action_name}' executada com sucesso.", parent=self)
-        except Exception as e:
+
+        def _err(e: Exception):
             AuditLogger.write(self.current_user, "erro_acao_operacional", f"acao={action_name};erro={e}")
             messagebox.showerror(APP_TITLE, f"Erro ao executar a ação:\n\n{e}", parent=self)
+
+        run_with_busy(self, f"Executando '{action_name}'...", _work, _ok, _err)
 class OpenInvoicesWindow(tk.Toplevel):
     GROUP_OPTIONS = {
         "Não agrupar": "none",
@@ -1188,9 +2148,9 @@ class OpenInvoicesWindow(tk.Toplevel):
         self.sort_column: Optional[str] = None
         self.sort_reverse = False
         self.status_var = tk.StringVar(value="Pronto.")
-        today_str = datetime.now().strftime("%d/%m/%Y")
-        self.period_start_var = tk.StringVar(value=today_str)
-        self.period_end_var = tk.StringVar(value=today_str)
+        today = date.today()
+        self.period_start_var = tk.StringVar(value=(today - timedelta(days=30)).strftime("%d/%m/%Y"))
+        self.period_end_var = tk.StringVar(value=(today + timedelta(days=180)).strftime("%d/%m/%Y"))
         self.group_by_var = tk.StringVar(value="Não agrupar")
         self.customer_var = tk.StringVar(value="Todos")
         self.account_var = tk.StringVar(value="Todas")
@@ -1199,7 +2159,9 @@ class OpenInvoicesWindow(tk.Toplevel):
         self.account_options_map: Dict[str, Any] = {"Todas": None}
         self.all_account_options_map: Dict[str, Any] = {"Todas": None}
         self._auto_filter_job = None
-        self.title(f"{APP_TITLE} - Faturas a receber")
+        self._loading = False
+        self._pending_reload = False
+        self.title(f"{APP_TITLE} - Faturas a receber (apenas com boletos vinculados)")
         self.geometry("1480x760")
         self.minsize(1320, 700)
         self.resizable(True, True)
@@ -1208,9 +2170,81 @@ class OpenInvoicesWindow(tk.Toplevel):
         self._setup_style()
         self._build_ui()
         self._center_window()
-        self._load_customer_options()
-        self._load_account_options()
-        self.load_data()
+        self._initial_load()
+
+    def _initial_load(self):
+        self.set_status("Conectando ao banco e carregando dados.")
+
+        def _work():
+            date_from = self._parse_date(self.period_start_var.get())
+            date_to = self._parse_date(self.period_end_var.get())
+            if date_from and date_to and date_from > date_to:
+                raise AppError("O período inicial não pode ser maior que o período final.")
+            db = Database(self.config_data)
+            customers = db.list_open_invoice_customers()
+            accounts = db.list_open_invoice_accounts()
+            invoices = db.list_open_invoices(due_date_from=date_from, due_date_to=date_to, customer_id=None, account_code=None)
+            return customers, accounts, invoices
+
+        def _ok(res):
+            customers, accounts, invoices = res
+
+            options_map = {"Todos": None}
+            for row in (customers or []):
+                label = f"{row.get('codigo_cliente')} - {row.get('cliente')}"
+                options_map[label] = row.get("customer_id")
+            self.all_customer_options_map = options_map
+            self.customer_options_map = dict(options_map)
+            self.customer_var.set("Todos")
+            self._hide_customer_suggestions()
+
+            acc_map = {"Todas": None}
+            for row in (accounts or []):
+                label = f"{row.get('conta')} - {row.get('conta_nome')}"
+                acc_map[label] = row.get("conta")
+            self.all_account_options_map = acc_map
+            self.account_options_map = dict(acc_map)
+            self.account_var.set("Todas")
+            self._hide_account_suggestions()
+
+            self._apply_invoices_data(invoices)
+
+        def _err(e: Exception):
+            self.set_status("Falha ao carregar dados.")
+            messagebox.showerror(APP_TITLE, f"Erro ao carregar faturas a receber:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Carregando faturas e filtros...", _work, _ok, _err)
+
+    def _apply_invoices_data(self, data):
+        self.raw_rows = [
+            InvoiceRow(
+                invoice_id=row.get("movto_id"),
+                company=row.get("empresa") or "",
+                customer_id=row.get("customer_id"),
+                customer_code=row.get("codigo_cliente"),
+                customer_name=row.get("cliente") or "",
+                motive_code=row.get("motivo"),
+                motive_name=f"Motivo {row.get('motivo')}" if row.get("motivo") not in (None, "") else "",
+                account_code=row.get("conta") or "",
+                account_name=row.get("conta_nome") or "",
+                issue_date=row.get("data"),
+                due_date=row.get("vencto"),
+                amount=row.get("valor"),
+                discount_amount=row.get("valor_desconto"),
+                paid_amount=row.get("valor_baixado"),
+                open_balance=row.get("saldo_em_aberto"),
+                customer_email=row.get("customer_email") or "",
+            )
+            for row in (data or [])
+        ]
+        self.rows = self._group_rows(self.raw_rows)
+        if self.sort_column:
+            self.rows.sort(key=lambda r: self._sort_value(r, self.sort_column), reverse=self.sort_reverse)
+        self._refresh_tree()
+        self._update_heading_titles()
+        total_open = sum(float(r.open_balance or 0) for r in self.rows)
+        self.set_status(f"{len(self.rows)} registro(s). Total em aberto: {total_open:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        AuditLogger.write(self.current_user, "carregar_lista", f"tipo=faturas_receber;quantidade={len(self.rows)};agrupar={self.GROUP_OPTIONS.get(self.group_by_var.get(), 'none')}")
     def _setup_style(self):
         style = ttk.Style(self)
         try:
@@ -1337,9 +2371,42 @@ class OpenInvoicesWindow(tk.Toplevel):
     def _apply_new_config(self, cfg: Dict[str, Any]):
         self.config_data = cfg
         self.on_config_saved(cfg)
-        self._load_customer_options()
-        self._load_account_options()
-        self.load_data()
+        current_customer = (self.customer_var.get() or "").strip() or "Todos"
+        current_account = (self.account_var.get() or "").strip() or "Todas"
+
+        def _work():
+            db = Database(self.config_data)
+            customers = db.list_open_invoice_customers()
+            accounts = db.list_open_invoice_accounts()
+            return customers, accounts
+
+        def _ok(res):
+            customers, accounts = res
+            options_map = {"Todos": None}
+            for row in (customers or []):
+                label = f"{row.get('codigo_cliente')} - {row.get('cliente')}"
+                options_map[label] = row.get("customer_id")
+            self.all_customer_options_map = options_map
+            self.customer_options_map = dict(options_map)
+            self.customer_var.set(current_customer if current_customer in options_map else "Todos")
+            self._hide_customer_suggestions()
+
+            acc_map = {"Todas": None}
+            for row in (accounts or []):
+                label = f"{row.get('conta')} - {row.get('conta_nome')}"
+                acc_map[label] = row.get("conta")
+            self.all_account_options_map = acc_map
+            self.account_options_map = dict(acc_map)
+            self.account_var.set(current_account if current_account in acc_map else "Todas")
+            self._hide_account_suggestions()
+
+            self.load_data()
+
+        def _err(e: Exception):
+            messagebox.showerror(APP_TITLE, f"Erro ao recarregar filtros:\n\n{e}", parent=self)
+            self.load_data()
+
+        run_with_busy(self, "Recarregando filtros...", _work, _ok, _err)
     def _schedule_auto_filter(self, event=None):
         if self._auto_filter_job is not None:
             try:
@@ -1354,9 +2421,9 @@ class OpenInvoicesWindow(tk.Toplevel):
         self.load_data()
 
     def clear_filters(self):
-        today_str = datetime.now().strftime("%d/%m/%Y")
-        self.period_start_var.set(today_str)
-        self.period_end_var.set(today_str)
+        today = date.today()
+        self.period_start_var.set((today - timedelta(days=30)).strftime("%d/%m/%Y"))
+        self.period_end_var.set((today + timedelta(days=180)).strftime("%d/%m/%Y"))
         self.customer_var.set("Todos")
         self.account_var.set("Todas")
         self.group_by_var.set("Não agrupar")
@@ -1414,42 +2481,53 @@ class OpenInvoicesWindow(tk.Toplevel):
 
     def _matching_customer_labels(self, typed: str):
         typed = (typed or "").strip().lower()
-        if not typed:
-            return [label for label in self.all_customer_options_map.keys()]
-        return [
-            label
-            for label in self.all_customer_options_map.keys()
-            if label != "Todos" and typed in label.lower()
-        ]
+        if not typed or typed == "todos":
+            return []
+        parts = [p for p in re.split(r"\s+", typed) if p]
+        labels = []
+        for label in self.all_customer_options_map.keys():
+            if label == "Todos":
+                continue
+            low = label.lower()
+            if all(p in low for p in parts):
+                labels.append(label)
+        return labels[:200]
 
     def _show_customer_suggestions(self, labels):
+        if not labels:
+            self._hide_customer_suggestions()
+            return
         self.customer_listbox.delete(0, "end")
         for label in labels:
             self.customer_listbox.insert("end", label)
-
-        if labels:
-            self.customer_suggestions_frame.grid()
-            self.customer_listbox.selection_clear(0, "end")
-            self.customer_listbox.selection_set(0)
-        else:
-            self._hide_customer_suggestions()
+        self.customer_suggestions_frame.grid()
+        self.customer_listbox.selection_clear(0, "end")
+        self.customer_listbox.selection_set(0)
+        self.customer_listbox.activate(0)
+        self.customer_listbox.see(0)
 
     def _hide_customer_suggestions(self):
         if hasattr(self, "customer_suggestions_frame"):
             self.customer_suggestions_frame.grid_remove()
 
     def _apply_customer_search(self, typed: str):
-        labels = self._matching_customer_labels(typed)
-        filtered = {label: self.all_customer_options_map.get(label) for label in labels}
-        self.customer_options_map = filtered
-        if (typed or "").strip():
-            self._show_customer_suggestions(labels)
-        else:
+        typed = (typed or "").strip()
+        if not typed or typed == "Todos":
+            self.customer_options_map = dict(self.all_customer_options_map)
             self._hide_customer_suggestions()
+            return
+        labels = self._matching_customer_labels(typed)
+        self.customer_options_map = {label: self.all_customer_options_map.get(label) for label in labels}
+        self._show_customer_suggestions(labels)
 
     def _on_customer_keyrelease(self, event=None):
         keysym = getattr(event, "keysym", "")
         if keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return None
+        if not (self.customer_var.get() or "").strip():
+            self.customer_var.set("Todos")
+            self._hide_customer_suggestions()
+            self._schedule_auto_filter()
             return None
         self._apply_customer_search(self.customer_var.get())
         return None
@@ -1462,9 +2540,14 @@ class OpenInvoicesWindow(tk.Toplevel):
 
     def _on_customer_focus_out(self, event=None):
         self.after(150, self._hide_customer_suggestions)
+        if not (self.customer_var.get() or "").strip():
+            self.customer_var.set("Todos")
+            self._schedule_auto_filter()
         return None
 
     def _on_customer_arrow_down(self, event=None):
+        if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
+            self._apply_customer_search(self.customer_var.get())
         if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
             return "break"
         selection = self.customer_listbox.curselection()
@@ -1478,6 +2561,8 @@ class OpenInvoicesWindow(tk.Toplevel):
         return "break"
 
     def _on_customer_arrow_up(self, event=None):
+        if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
+            self._apply_customer_search(self.customer_var.get())
         if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
             return "break"
         selection = self.customer_listbox.curselection()
@@ -1573,42 +2658,53 @@ class OpenInvoicesWindow(tk.Toplevel):
 
     def _matching_account_labels(self, typed: str):
         typed = (typed or "").strip().lower()
-        if not typed:
-            return [label for label in self.all_account_options_map.keys()]
-        return [
-            label
-            for label in self.all_account_options_map.keys()
-            if label != "Todas" and typed in label.lower()
-        ]
+        if not typed or typed == "todas":
+            return []
+        parts = [p for p in re.split(r"\s+", typed) if p]
+        labels = []
+        for label in self.all_account_options_map.keys():
+            if label == "Todas":
+                continue
+            low = label.lower()
+            if all(p in low for p in parts):
+                labels.append(label)
+        return labels[:200]
 
     def _show_account_suggestions(self, labels):
+        if not labels:
+            self._hide_account_suggestions()
+            return
         self.account_listbox.delete(0, "end")
         for label in labels:
             self.account_listbox.insert("end", label)
-
-        if labels:
-            self.account_suggestions_frame.grid()
-            self.account_listbox.selection_clear(0, "end")
-            self.account_listbox.selection_set(0)
-        else:
-            self._hide_account_suggestions()
+        self.account_suggestions_frame.grid()
+        self.account_listbox.selection_clear(0, "end")
+        self.account_listbox.selection_set(0)
+        self.account_listbox.activate(0)
+        self.account_listbox.see(0)
 
     def _hide_account_suggestions(self):
         if hasattr(self, "account_suggestions_frame"):
             self.account_suggestions_frame.grid_remove()
 
     def _apply_account_search(self, typed: str):
-        labels = self._matching_account_labels(typed)
-        filtered = {label: self.all_account_options_map.get(label) for label in labels}
-        self.account_options_map = filtered
-        if (typed or "").strip():
-            self._show_account_suggestions(labels)
-        else:
+        typed = (typed or "").strip()
+        if not typed or typed == "Todas":
+            self.account_options_map = dict(self.all_account_options_map)
             self._hide_account_suggestions()
+            return
+        labels = self._matching_account_labels(typed)
+        self.account_options_map = {label: self.all_account_options_map.get(label) for label in labels}
+        self._show_account_suggestions(labels)
 
     def _on_account_keyrelease(self, event=None):
         keysym = getattr(event, "keysym", "")
         if keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return None
+        if not (self.account_var.get() or "").strip():
+            self.account_var.set("Todas")
+            self._hide_account_suggestions()
+            self._schedule_auto_filter()
             return None
         self._apply_account_search(self.account_var.get())
         return None
@@ -1621,9 +2717,14 @@ class OpenInvoicesWindow(tk.Toplevel):
 
     def _on_account_focus_out(self, event=None):
         self.after(150, self._hide_account_suggestions)
+        if not (self.account_var.get() or "").strip():
+            self.account_var.set("Todas")
+            self._schedule_auto_filter()
         return None
 
     def _on_account_arrow_down(self, event=None):
+        if not self.account_suggestions_frame.winfo_ismapped() or self.account_listbox.size() == 0:
+            self._apply_account_search(self.account_var.get())
         if not self.account_suggestions_frame.winfo_ismapped() or self.account_listbox.size() == 0:
             return "break"
         selection = self.account_listbox.curselection()
@@ -1637,6 +2738,8 @@ class OpenInvoicesWindow(tk.Toplevel):
         return "break"
 
     def _on_account_arrow_up(self, event=None):
+        if not self.account_suggestions_frame.winfo_ismapped() or self.account_listbox.size() == 0:
+            self._apply_account_search(self.account_var.get())
         if not self.account_suggestions_frame.winfo_ismapped() or self.account_listbox.size() == 0:
             return "break"
         selection = self.account_listbox.curselection()
@@ -1804,50 +2907,47 @@ class OpenInvoicesWindow(tk.Toplevel):
             grouped[key].open_balance = float(grouped[key].open_balance or 0) + float(row.open_balance or 0)
         return list(grouped.values())
     def load_data(self):
+        if self._loading:
+            self._pending_reload = True
+            return
         try:
             date_from = self._parse_date(self.period_start_var.get())
             date_to = self._parse_date(self.period_end_var.get())
             if date_from and date_to and date_from > date_to:
                 raise AppError("O período inicial não pode ser maior que o período final.")
-            self.set_status("Conectando ao banco e carregando faturas a receber.")
-            data = Database(self.config_data).list_open_invoices(
-                due_date_from=date_from,
-                due_date_to=date_to,
-                customer_id=self._selected_customer_id(),
-                account_code=self._selected_account_code(),
-            )
-            self.raw_rows = [
-                InvoiceRow(
-                    invoice_id=row.get("movto_id"),
-                    company=row.get("empresa") or "",
-                    customer_id=row.get("customer_id"),
-                    customer_code=row.get("codigo_cliente"),
-                    customer_name=row.get("cliente") or "",
-                    motive_code=row.get("motivo"),
-                    motive_name=f"Motivo {row.get('motivo')}" if row.get("motivo") not in (None, "") else "",
-                    account_code=row.get("conta") or "",
-                    account_name=row.get("conta_nome") or "",
-                    issue_date=row.get("data"),
-                    due_date=row.get("vencto"),
-                    amount=row.get("valor"),
-                    discount_amount=row.get("valor_desconto"),
-                    paid_amount=row.get("valor_baixado"),
-                    open_balance=row.get("saldo_em_aberto"),
-                    customer_email=row.get("customer_email") or "",
-                )
-                for row in data
-            ]
-            self.rows = self._group_rows(self.raw_rows)
-            if self.sort_column:
-                self.rows.sort(key=lambda r: self._sort_value(r, self.sort_column), reverse=self.sort_reverse)
-            self._refresh_tree()
-            self._update_heading_titles()
-            total_open = sum(float(r.open_balance or 0) for r in self.rows)
-            self.set_status(f"{len(self.rows)} registro(s). Total em aberto: {total_open:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-            AuditLogger.write(self.current_user, "carregar_lista", f"tipo=faturas_receber;quantidade={len(self.rows)};agrupar={self.GROUP_OPTIONS.get(self.group_by_var.get(), 'none')}")
         except Exception as e:
             self.set_status("Falha ao carregar dados.")
             messagebox.showerror(APP_TITLE, f"Erro ao carregar faturas a receber:\n\n{e}", parent=self)
+            return
+
+        customer_id = self._selected_customer_id()
+        account_code = self._selected_account_code()
+        self.set_status("Conectando ao banco e carregando faturas a receber.")
+        self._loading = True
+
+        def _work():
+            return Database(self.config_data).list_open_invoices(
+                due_date_from=date_from,
+                due_date_to=date_to,
+                customer_id=customer_id,
+                account_code=account_code,
+            )
+
+        def _ok(data):
+            self._apply_invoices_data(data)
+            self._loading = False
+            if self._pending_reload:
+                self._pending_reload = False
+                self.load_data()
+
+        def _err(e: Exception):
+            self.set_status("Falha ao carregar dados.")
+            messagebox.showerror(APP_TITLE, f"Erro ao carregar faturas a receber:\n\n{e}", parent=self)
+            self._loading = False
+            if self._pending_reload:
+                self._pending_reload = False
+
+        run_with_busy(self, "Carregando faturas...", _work, _ok, _err)
     def _selected_invoice_row(self) -> Optional[InvoiceRow]:
         selected = self.tree.selection()
         if not selected:
@@ -1865,12 +2965,21 @@ class OpenInvoicesWindow(tk.Toplevel):
         if not row.customer_id:
             messagebox.showwarning(APP_TITLE, "Não foi possível identificar o cliente da linha selecionada.", parent=self)
             return
-        try:
-            email = row.customer_email or Database(self.config_data).get_customer_email(row.customer_id)
-        except Exception as e:
-            messagebox.showerror(APP_TITLE, f"Erro ao buscar o e-mail do cliente:\n\n{e}", parent=self)
+        email = str(row.customer_email or "").strip()
+        if email:
+            EmailComposeWindow(self, self.config_data, self.current_user, row, email)
             return
-        EmailComposeWindow(self, self.config_data, self.current_user, row, email or "")
+
+        def _work():
+            return Database(self.config_data).get_customer_email(row.customer_id)
+
+        def _ok(found_email):
+            EmailComposeWindow(self, self.config_data, self.current_user, row, str(found_email or "").strip())
+
+        def _err(e: Exception):
+            messagebox.showerror(APP_TITLE, f"Erro ao buscar o e-mail do cliente:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Buscando e-mail do cliente...", _work, _ok, _err)
 
     def _row_values(self, row: InvoiceRow):
         return (
@@ -1891,9 +3000,1636 @@ class OpenInvoicesWindow(tk.Toplevel):
         for row in self.rows:
             item_id = self.tree.insert("", "end", values=self._row_values(row))
             self.tree_items[item_id] = row
+
+
+class FinanceiroAlertasWindow(tk.Toplevel):
+    def __init__(self, master, config_data: Dict[str, Any], current_user: str, on_config_saved):
+        super().__init__(master)
+        self.master_app = master
+        self.config_data = deepcopy(config_data)
+        self.current_user = current_user
+        self.on_config_saved = on_config_saved
+        self.status_var = tk.StringVar(value="Pronto.")
+        self.selected_id = None
+        self.title(f"{APP_TITLE} - Alertas de vencimento")
+        self.geometry("1400x680")
+        self.minsize(1000, 620)
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._build_ui()
+        self._center_window()
+        self.reload()
+
+    def _center_window(self):
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - self.winfo_width()) // 2
+        y = (sh - self.winfo_height()) // 2
+        self.geometry(f"+{max(x, 20)}+{max(y, 20)}")
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(16, 12, 16, 0))
+        header.pack(fill="x")
+        ttk.Label(header, text="Alertas de Vencimento", font=("Segoe UI", 14, "bold"), foreground="#2563eb").pack(side="left")
+        ttk.Label(header, text="Envio automático por vencimento do boleto (apenas com boletos vinculados).", font=("Segoe UI", 10), foreground="#6b7280").pack(side="left", padx=(12, 0), pady=(4, 0))
+
+        top = ttk.Frame(self, padding=(12, 10, 12, 10))
+        top.pack(fill="x")
+        ttk.Button(top, text="+ Novo Alerta", command=self._new).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Editar", command=self._edit).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Excluir", command=self._delete).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Atualizar", command=self.reload).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Voltar ao início", command=self._close).pack(side="right")
+
+        mid = ttk.Frame(self, padding=(12, 0, 12, 10))
+        mid.pack(fill="both", expand=True)
+        cols = ("nome", "ativo", "hora", "antes", "depois", "grupo", "portador", "ultimo_envio", "enviados", "sem_email", "falhas")
+        self.tree = ttk.Treeview(mid, columns=cols, show="headings")
+        self.tree.heading("nome", text="Nome")
+        self.tree.heading("ativo", text="Ativo")
+        self.tree.heading("hora", text="Hora")
+        self.tree.heading("antes", text="Antes (dias)")
+        self.tree.heading("depois", text="Depois (dias)")
+        self.tree.heading("grupo", text="Grupo")
+        self.tree.heading("portador", text="Portador")
+        self.tree.heading("ultimo_envio", text="Último envio")
+        self.tree.heading("enviados", text="Enviados")
+        self.tree.heading("sem_email", text="Sem e-mail")
+        self.tree.heading("falhas", text="Falhas")
+        self.tree.column("nome", width=260, anchor="w")
+        self.tree.column("ativo", width=70, anchor="center")
+        self.tree.column("hora", width=70, anchor="center")
+        self.tree.column("antes", width=90, anchor="center")
+        self.tree.column("depois", width=95, anchor="center")
+        self.tree.column("grupo", width=200, anchor="w")
+        self.tree.column("portador", width=200, anchor="w")
+        self.tree.column("ultimo_envio", width=140, anchor="center")
+        self.tree.column("enviados", width=80, anchor="center")
+        self.tree.column("sem_email", width=80, anchor="center")
+        self.tree.column("falhas", width=70, anchor="center")
+        vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        mid.columnconfigure(0, weight=1)
+        mid.rowconfigure(0, weight=1)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", lambda e: self._edit())
+
+        bottom = ttk.Frame(self, padding=(12, 0, 12, 10))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
+        ttk.Label(bottom, text=f"Usuário: {self.current_user}").pack(side="right")
+
+    def _agenda_rows(self):
+        agendas = self.config_data.get("financeiro_agendas", []) or []
+        return [a for a in agendas if isinstance(a, dict)]
+
+    def reload(self):
+        self.status_var.set("Carregando alertas...")
+        agendas = self._agenda_rows()
+
+        def _work():
+            groups_map: Dict[str, str] = {}
+            port_map: Dict[str, str] = {}
+            try:
+                db = Database(self.config_data)
+                for g in db.list_grupos_pessoa():
+                    groups_map[str(g.get("grid"))] = str(g.get("nome") or "").strip()
+                for p in db.list_portadores():
+                    port_map[str(p.get("grid"))] = str(p.get("nome") or "").strip()
+            except Exception:
+                groups_map = {}
+                port_map = {}
+            return groups_map, port_map
+
+        def _ok(res):
+            groups_map, port_map = res
+            try:
+                for it in self.tree.get_children():
+                    self.tree.delete(it)
+
+                agendas.sort(key=lambda a: (str(a.get("name") or "").lower(), str(a.get("id") or "")))
+                for a in agendas:
+                    iid = str(a.get("id") or "")
+                    gid = a.get("group_id")
+                    pid = a.get("portador_id")
+                    group_name = groups_map.get(str(gid), "") if gid not in (None, "", 0, "0") else ""
+                    port_name = port_map.get(str(pid), "") if pid not in (None, "", 0, "0") else ""
+                    before_days = int(a.get("days_before_due") or 0)
+                    after_days = int(a.get("days_after_due") or 0)
+                    last_run_at = str(a.get("last_run_at") or "").strip()
+                    last_run_txt = ""
+                    if last_run_at:
+                        try:
+                            last_run_txt = datetime.fromisoformat(last_run_at).strftime("%d/%m/%Y %H:%M")
+                        except Exception:
+                            last_run_txt = last_run_at
+                    last_result = a.get("last_result") or {}
+                    enviados = int(last_result.get("emails_sent") or 0)
+                    sem_email = int(last_result.get("skipped_no_email") or 0)
+                    falhas = int(last_result.get("failed") or 0)
+                    self.tree.insert(
+                        "",
+                        "end",
+                        iid=iid,
+                        values=(
+                            str(a.get("name") or "").strip(),
+                            "Sim" if a.get("enabled") else "Não",
+                            str(a.get("send_time") or "06:00").strip(),
+                            before_days,
+                            after_days,
+                            group_name,
+                            port_name,
+                            last_run_txt,
+                            enviados,
+                            sem_email,
+                            falhas,
+                        ),
+                    )
+                self.status_var.set(f"{len(agendas)} alerta(s).")
+            except Exception as e:
+                self.status_var.set("Falha ao carregar alertas.")
+                messagebox.showerror(APP_TITLE, f"Erro ao carregar alertas:\n\n{e}", parent=self)
+
+        def _err(e: Exception):
+            self.status_var.set("Falha ao carregar alertas.")
+            messagebox.showerror(APP_TITLE, f"Erro ao carregar alertas:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Carregando alertas...", _work, _ok, _err)
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        self.selected_id = sel[0] if sel else None
+
+    def _new(self):
+        FinanceiroAlertaWindow(self, self.config_data, self.current_user, self._after_saved, agenda_id=None)
+
+    def _edit(self):
+        if not self.selected_id:
+            messagebox.showwarning(APP_TITLE, "Selecione um alerta.", parent=self)
+            return
+        FinanceiroAlertaWindow(self, self.config_data, self.current_user, self._after_saved, agenda_id=self.selected_id)
+
+    def _delete(self):
+        if not self.selected_id:
+            messagebox.showwarning(APP_TITLE, "Selecione um alerta.", parent=self)
+            return
+        if not messagebox.askyesno(APP_TITLE, "Deseja excluir o alerta selecionado?", parent=self):
+            return
+        agendas = self._agenda_rows()
+        agendas = [a for a in agendas if str(a.get("id") or "") != str(self.selected_id)]
+        self.config_data["financeiro_agendas"] = agendas
+        ConfigManager.save(self.config_data)
+        self.config_data = ConfigManager.load()
+        self.on_config_saved(self.config_data)
+        self.selected_id = None
+        self.reload()
+
+    def _after_saved(self, cfg: Dict[str, Any]):
+        self.config_data = cfg
+        self.on_config_saved(cfg)
+        self.reload()
+
+    def _close(self):
+        self.destroy()
+        if hasattr(self.master_app, "alerts_window"):
+            self.master_app.alerts_window = None
+        if hasattr(self.master_app, "show_home"):
+            self.master_app.show_home()
+
+
+class FinanceiroAlertaWindow(tk.Toplevel):
+    def __init__(self, master, config_data: Dict[str, Any], current_user: str, on_config_saved, agenda_id: Optional[str] = None):
+        super().__init__(master)
+        self.master_app = master
+        self.config_data = deepcopy(config_data)
+        self.current_user = current_user
+        self.on_config_saved = on_config_saved
+        self.agenda_id = str(agenda_id) if agenda_id is not None else ""
+        self.name_var = tk.StringVar(value="")
+        self.enabled_var = tk.BooleanVar(value=True)
+        self.send_time_var = tk.StringVar(value="06:00")
+        self.send_pix_qrcode_var = tk.BooleanVar(value=False)
+        self.days_before_var = tk.IntVar(value=5)
+        self.days_after_var = tk.IntVar(value=0)
+        self.base_date_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        self.group_var = tk.StringVar(value="Todos")
+        self.portador_var = tk.StringVar(value="Todos")
+        self.customer_var = tk.StringVar(value="Todos")
+        self.status_var = tk.StringVar(value="Pronto.")
+        self.group_options_map: Dict[str, Any] = {"Todos": None}
+        self.portador_options_map: Dict[str, Any] = {"Todos": None}
+        self.all_group_options_map: Dict[str, Any] = {"Todos": None}
+        self.all_portador_options_map: Dict[str, Any] = {"Todos": None}
+        self.customer_options_map: Dict[str, Any] = {"Todos": None}
+        self.all_customer_options_map: Dict[str, Any] = {"Todos": None}
+        self._customer_filter_job = None
+        self._group_filter_job = None
+        self._portador_filter_job = None
+        self._send_thread = None
+        self._extra_body_value = ""
+
+        self.title(f"{APP_TITLE} - Alerta de vencimento de fatura")
+        self.geometry("1280x820")
+        self.minsize(1120, 720)
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        agenda_cfg = None
+        if self.agenda_id:
+            for a in (self.config_data.get("financeiro_agendas", []) or []):
+                if isinstance(a, dict) and str(a.get("id") or "") == str(self.agenda_id):
+                    agenda_cfg = a
+                    break
+        if agenda_cfg:
+            self.name_var.set(str(agenda_cfg.get("name") or "").strip())
+            self.enabled_var.set(bool(agenda_cfg.get("enabled", False)))
+            self.send_time_var.set(str(agenda_cfg.get("send_time") or "06:00").strip() or "06:00")
+            self.send_pix_qrcode_var.set(bool(agenda_cfg.get("send_pix_qrcode", False)))
+            try:
+                self.days_before_var.set(int(agenda_cfg.get("days_before_due", 5) or 5))
+            except Exception:
+                self.days_before_var.set(5)
+            try:
+                self.days_after_var.set(int(agenda_cfg.get("days_after_due", 0) or 0))
+            except Exception:
+                self.days_after_var.set(0)
+            self._extra_body_value = str(agenda_cfg.get("extra_body") or "")
+            saved_group = agenda_cfg.get("group_id")
+            saved_portador = agenda_cfg.get("portador_id")
+            saved_customer = agenda_cfg.get("customer_id")
+        else:
+            saved_group = None
+            saved_portador = None
+            saved_customer = None
+
+        self._build_ui()
+        self._center_window()
+        self._preview_loading = False
+        self._preview_pending = False
+        self._initial_load(saved_group, saved_portador, saved_customer)
+
+    def _initial_load(self, saved_group=None, saved_portador=None, saved_customer=None):
+        self._update_hint_text()
+
+        def _work():
+            db = Database(self.config_data)
+            groups = db.list_grupos_pessoa()
+            portadores = db.list_portadores()
+            customers = db.list_customer_options_tipo_c()
+            return groups, portadores, customers
+
+        def _ok(res):
+            groups, portadores, customers = res
+            self._load_group_options(saved_group, grupos=groups)
+            self._load_portador_options(saved_portador, portadores=portadores)
+            self._load_customer_options(saved_customer, customers=customers)
+            self.refresh_preview()
+
+        def _err(e: Exception):
+            self.status_var.set("Falha ao carregar dados.")
+            messagebox.showerror(APP_TITLE, f"Erro ao carregar dados:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Carregando opções...", _work, _ok, _err)
+
+    def _center_window(self):
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - self.winfo_width()) // 2
+        y = (sh - self.winfo_height()) // 2
+        self.geometry(f"+{max(x, 20)}+{max(y, 20)}")
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(16, 12, 16, 0))
+        header.pack(fill="x")
+        ttk.Label(header, text="Alerta de Vencimento de Fatura", font=("Segoe UI", 14, "bold"), foreground="#2563eb").pack(side="left")
+        ttk.Label(header, text="Somente faturas com boleto vinculado serão listadas/enviadas.", font=("Segoe UI", 10), foreground="#d9534f").pack(side="left", padx=(12, 0), pady=(4, 0))
+        hint = ttk.Frame(self, padding=(16, 2, 16, 8))
+        hint.pack(fill="x")
+        self.mode_hint_label = ttk.Label(hint, text="", font=("Segoe UI", 10), foreground="#6b7280")
+        self.mode_hint_label.pack(side="left")
+
+        settings_container = ttk.Frame(self, padding=(12, 8, 12, 8))
+        settings_container.pack(fill="x")
+
+        general_frame = ttk.LabelFrame(settings_container, text=" Configuração ", padding=(12, 10, 12, 10))
+        general_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        ttk.Label(general_frame, text="Nome:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(general_frame, textvariable=self.name_var, width=42).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(general_frame, text="Ativo", variable=self.enabled_var).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(general_frame, text="Hora do disparo:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=4)
+        ttk.Entry(general_frame, textvariable=self.send_time_var, width=10).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Checkbutton(general_frame, text="Incluir QRCode PIX no boleto (PDF)", variable=self.send_pix_qrcode_var).grid(row=3, column=1, sticky="w", pady=(6, 4))
+
+        rules_frame = ttk.LabelFrame(settings_container, text=" Regras ", padding=(12, 10, 12, 10))
+        rules_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        ttk.Label(rules_frame, text="Dias antes do venc.:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.days_spin = ttk.Spinbox(rules_frame, from_=0, to=60, textvariable=self.days_before_var, width=10, command=self._schedule_refresh)
+        self.days_spin.grid(row=0, column=1, sticky="w", pady=4)
+        self.days_spin.bind("<KeyRelease>", lambda e: self._schedule_refresh())
+        ttk.Label(rules_frame, text="Dias após o venc.:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.days_after_spin = ttk.Spinbox(rules_frame, from_=0, to=60, textvariable=self.days_after_var, width=10, command=self._schedule_refresh)
+        self.days_after_spin.grid(row=1, column=1, sticky="w", pady=4)
+        self.days_after_spin.bind("<KeyRelease>", lambda e: self._schedule_refresh())
+        ttk.Label(rules_frame, text="Grupo de cliente:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.group_entry = ttk.Entry(rules_frame, textvariable=self.group_var, width=35)
+        self.group_entry.grid(row=2, column=1, sticky="w", pady=4)
+        self.group_entry.bind("<KeyRelease>", self._on_group_keyrelease)
+        self.group_entry.bind("<FocusIn>", self._on_group_focus_in)
+        self.group_entry.bind("<FocusOut>", self._on_group_focus_out)
+        self.group_entry.bind("<Down>", self._on_group_arrow_down)
+        self.group_entry.bind("<Up>", self._on_group_arrow_up)
+        self.group_entry.bind("<Return>", self._on_group_entry_confirm)
+        self.group_suggestions_frame = ttk.Frame(rules_frame)
+        self.group_suggestions_frame.grid(row=3, column=1, sticky="nsew", pady=(0, 2))
+        self.group_suggestions_frame.grid_remove()
+        self.group_listbox = tk.Listbox(self.group_suggestions_frame, height=6, exportselection=False)
+        self.group_listbox.pack(fill="x", expand=True)
+        self.group_listbox.bind("<ButtonRelease-1>", self._on_group_listbox_confirm)
+        self.group_listbox.bind("<Double-Button-1>", self._on_group_listbox_confirm)
+        self.group_listbox.bind("<Return>", self._on_group_listbox_confirm)
+
+        ttk.Label(rules_frame, text="Portador:").grid(row=4, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.portador_entry = ttk.Entry(rules_frame, textvariable=self.portador_var, width=35)
+        self.portador_entry.grid(row=4, column=1, sticky="w", pady=4)
+        self.portador_entry.bind("<KeyRelease>", self._on_portador_keyrelease)
+        self.portador_entry.bind("<FocusIn>", self._on_portador_focus_in)
+        self.portador_entry.bind("<FocusOut>", self._on_portador_focus_out)
+        self.portador_entry.bind("<Down>", self._on_portador_arrow_down)
+        self.portador_entry.bind("<Up>", self._on_portador_arrow_up)
+        self.portador_entry.bind("<Return>", self._on_portador_entry_confirm)
+        self.portador_suggestions_frame = ttk.Frame(rules_frame)
+        self.portador_suggestions_frame.grid(row=5, column=1, sticky="nsew", pady=(0, 2))
+        self.portador_suggestions_frame.grid_remove()
+        self.portador_listbox = tk.Listbox(self.portador_suggestions_frame, height=6, exportselection=False)
+        self.portador_listbox.pack(fill="x", expand=True)
+        self.portador_listbox.bind("<ButtonRelease-1>", self._on_portador_listbox_confirm)
+        self.portador_listbox.bind("<Double-Button-1>", self._on_portador_listbox_confirm)
+        self.portador_listbox.bind("<Return>", self._on_portador_listbox_confirm)
+
+        ttk.Label(rules_frame, text="Cliente:").grid(row=6, column=0, sticky="w", padx=(0, 6), pady=4)
+        self.customer_entry = ttk.Entry(rules_frame, textvariable=self.customer_var, width=35)
+        self.customer_entry.grid(row=6, column=1, sticky="w", pady=4)
+        self.customer_entry.bind("<KeyRelease>", self._on_customer_keyrelease)
+        self.customer_entry.bind("<FocusIn>", self._on_customer_focus_in)
+        self.customer_entry.bind("<FocusOut>", self._on_customer_focus_out)
+        self.customer_entry.bind("<Down>", self._on_customer_arrow_down)
+        self.customer_entry.bind("<Up>", self._on_customer_arrow_up)
+        self.customer_entry.bind("<Return>", self._on_customer_entry_confirm)
+        self.customer_suggestions_frame = ttk.Frame(rules_frame)
+        self.customer_suggestions_frame.grid(row=7, column=1, sticky="nsew", pady=(0, 2))
+        self.customer_suggestions_frame.grid_remove()
+        self.customer_listbox = tk.Listbox(self.customer_suggestions_frame, height=6, exportselection=False)
+        self.customer_listbox.pack(fill="x", expand=True)
+        self.customer_listbox.bind("<ButtonRelease-1>", self._on_customer_listbox_confirm)
+        self.customer_listbox.bind("<Double-Button-1>", self._on_customer_listbox_confirm)
+        self.customer_listbox.bind("<Return>", self._on_customer_listbox_confirm)
+
+        preview_header = ttk.Frame(self, padding=(12, 0, 12, 6))
+        preview_header.pack(fill="x")
+        ttk.Label(preview_header, text="Prévia dos Clientes Abrangidos", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Label(preview_header, text="Data base (simulação):").pack(side="left", padx=(30, 6))
+        self.base_date_entry = ttk.Entry(preview_header, textvariable=self.base_date_var, width=14)
+        self.base_date_entry.pack(side="left")
+        bind_date_entry_shortcuts(self.base_date_entry)
+        self.base_date_entry.bind("<FocusOut>", lambda e: self._schedule_refresh(), add="+")
+
+        preview = ttk.Frame(self, padding=(12, 0, 12, 10))
+        preview.pack(fill="both", expand=True)
+        cols = ("cliente", "grupo", "email", "situacao", "titulos", "total", "portador")
+        self.tree = ttk.Treeview(preview, columns=cols, show="headings")
+        self.tree.heading("cliente", text="Cliente")
+        self.tree.heading("grupo", text="Grupo")
+        self.tree.heading("email", text="E-mail")
+        self.tree.heading("situacao", text="Situação")
+        self.tree.heading("titulos", text="Títulos")
+        self.tree.heading("total", text="Total")
+        self.tree.heading("portador", text="Portador")
+        self.tree.column("cliente", width=260, anchor="w")
+        self.tree.column("grupo", width=160, anchor="w")
+        self.tree.column("email", width=220, anchor="w")
+        self.tree.column("situacao", width=220, anchor="w")
+        self.tree.column("titulos", width=70, anchor="center")
+        self.tree.column("total", width=100, anchor="e")
+        self.tree.column("portador", width=160, anchor="w")
+        vsb = ttk.Scrollbar(preview, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(preview, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(0, weight=1)
+
+        bottom = ttk.Frame(self, padding=(12, 8, 12, 18))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
+        btns = ttk.Frame(bottom)
+        btns.pack(side="right")
+        ttk.Button(btns, text="Simular envio", command=self.simulate_now).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Enviar agora", command=self.send_now).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Salvar Alerta", command=self.save_settings).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Fechar", command=self._close).pack(side="left")
+
+    def _load_group_options(self, selected_id=None, grupos=None):
+        if grupos is None:
+            try:
+                grupos = Database(self.config_data).list_grupos_pessoa()
+            except Exception:
+                grupos = []
+        options = {"Todos": None}
+        for g in grupos:
+            gid = g.get("grid")
+            name = str(g.get("nome") or "").strip()
+            if gid in (None, "", 0, "0") or not name:
+                continue
+            options[name] = gid
+        self.all_group_options_map = options
+        self.group_options_map = options
+        if selected_id not in (None, "", 0, "0"):
+            for label, gid in options.items():
+                if str(gid) == str(selected_id):
+                    self.group_var.set(label)
+                    break
+        if not (self.group_var.get() or "").strip():
+            self.group_var.set("Todos")
+
+    def _load_portador_options(self, selected_id=None, portadores=None):
+        if portadores is None:
+            try:
+                portadores = Database(self.config_data).list_portadores()
+            except Exception:
+                portadores = []
+        options = {"Todos": None}
+        for p in portadores:
+            pid = p.get("grid")
+            name = str(p.get("nome") or "").strip()
+            if pid in (None, "", 0, "0") or not name:
+                continue
+            options[name] = pid
+        self.all_portador_options_map = options
+        self.portador_options_map = options
+        if selected_id not in (None, "", 0, "0"):
+            for label, pid in options.items():
+                if str(pid) == str(selected_id):
+                    self.portador_var.set(label)
+                    break
+        if not (self.portador_var.get() or "").strip():
+            self.portador_var.set("Todos")
+
+    def _load_customer_options(self, selected_customer_id=None, customers=None):
+        if customers is None:
+            try:
+                customers = Database(self.config_data).list_customer_options_tipo_c()
+            except Exception:
+                customers = []
+        options = {"Todos": None}
+        for c in customers:
+            cid = c.get("customer_id")
+            code = str(c.get("codigo_cliente") or "").strip()
+            name = str(c.get("cliente") or "").strip()
+            if cid in (None, "", 0, "0") or not name:
+                continue
+            label = f"{code} - {name}".strip(" -")
+            options[label] = cid
+        self.all_customer_options_map = options
+        self.customer_options_map = dict(options)
+        if selected_customer_id not in (None, "", 0, "0"):
+            for label, cid in options.items():
+                if str(cid) == str(selected_customer_id):
+                    self.customer_var.set(label)
+                    break
+        if self.customer_var.get() not in options:
+            self.customer_var.set("Todos")
+
+    def _selected_group_id(self):
+        typed = (self.group_var.get() or "").strip()
+        if not typed or typed == "Todos":
+            return None
+        exact = self.all_group_options_map.get(typed)
+        if exact is not None:
+            return exact
+        typed_lower = typed.lower()
+        matches = [gid for label, gid in self.all_group_options_map.items() if label != "Todos" and typed_lower in label.lower()]
+        return matches[0] if len(matches) == 1 else None
+
+    def _selected_portador_id(self):
+        typed = (self.portador_var.get() or "").strip()
+        if not typed or typed == "Todos":
+            return None
+        exact = self.all_portador_options_map.get(typed)
+        if exact is not None:
+            return exact
+        typed_lower = typed.lower()
+        matches = [pid for label, pid in self.all_portador_options_map.items() if label != "Todos" and typed_lower in label.lower()]
+        return matches[0] if len(matches) == 1 else None
+
+    def _selected_customer_id(self):
+        typed = (self.customer_var.get() or "").strip()
+        if not typed or typed == "Todos":
+            return None
+        exact = self.all_customer_options_map.get(typed)
+        if exact is not None:
+            return exact
+        typed_lower = typed.lower()
+        matches = [cid for label, cid in self.all_customer_options_map.items() if label != "Todos" and typed_lower in label.lower()]
+        return matches[0] if len(matches) == 1 else None
+
+    def _matching_group_labels(self, typed: str):
+        typed = (typed or "").strip().lower()
+        if not typed or typed == "todos":
+            return []
+        parts = [p for p in re.split(r"\s+", typed) if p]
+        labels = []
+        for label in self.all_group_options_map.keys():
+            if label == "Todos":
+                continue
+            low = label.lower()
+            if all(p in low for p in parts):
+                labels.append(label)
+        return labels[:200]
+
+    def _show_group_suggestions(self, labels):
+        if not labels:
+            self._hide_group_suggestions()
+            return
+        self.group_listbox.delete(0, "end")
+        for label in labels:
+            self.group_listbox.insert("end", label)
+        self.group_suggestions_frame.grid()
+        self.group_listbox.selection_clear(0, "end")
+        self.group_listbox.selection_set(0)
+        self.group_listbox.activate(0)
+        self.group_listbox.see(0)
+
+    def _hide_group_suggestions(self):
+        self.group_suggestions_frame.grid_remove()
+
+    def _on_group_keyrelease(self, event=None):
+        keysym = getattr(event, "keysym", "")
+        if keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return None
+        if not (self.group_var.get() or "").strip():
+            self.group_var.set("Todos")
+            self._hide_group_suggestions()
+            self._schedule_refresh()
+            return None
+        if self._group_filter_job is not None:
+            try:
+                self.after_cancel(self._group_filter_job)
+            except Exception:
+                pass
+        self._group_filter_job = self.after(150, self._apply_group_search)
+        return None
+
+    def _apply_group_search(self):
+        self._group_filter_job = None
+        typed = (self.group_var.get() or "").strip()
+        if not typed or typed == "Todos":
+            self._hide_group_suggestions()
+            return
+        self._show_group_suggestions(self._matching_group_labels(typed))
+
+    def _on_group_focus_in(self, event=None):
+        typed = (self.group_var.get() or "").strip()
+        if typed and typed != "Todos":
+            self._show_group_suggestions(self._matching_group_labels(typed))
+        return None
+
+    def _on_group_focus_out(self, event=None):
+        self.after(120, self._hide_group_suggestions)
+        if not (self.group_var.get() or "").strip():
+            self.group_var.set("Todos")
+        self._schedule_refresh()
+
+    def _on_group_arrow_down(self, event=None):
+        if not self.group_suggestions_frame.winfo_ismapped() or self.group_listbox.size() == 0:
+            self._show_group_suggestions(self._matching_group_labels(self.group_var.get()))
+        if not self.group_suggestions_frame.winfo_ismapped() or self.group_listbox.size() == 0:
+            return "break"
+        selection = self.group_listbox.curselection()
+        index = selection[0] + 1 if selection else 0
+        if index >= self.group_listbox.size():
+            index = self.group_listbox.size() - 1
+        self.group_listbox.selection_clear(0, "end")
+        self.group_listbox.selection_set(index)
+        self.group_listbox.activate(index)
+        self.group_listbox.see(index)
+        return "break"
+
+    def _on_group_arrow_up(self, event=None):
+        if not self.group_suggestions_frame.winfo_ismapped() or self.group_listbox.size() == 0:
+            return "break"
+        selection = self.group_listbox.curselection()
+        index = selection[0] - 1 if selection else 0
+        if index < 0:
+            index = 0
+        self.group_listbox.selection_clear(0, "end")
+        self.group_listbox.selection_set(index)
+        self.group_listbox.activate(index)
+        self.group_listbox.see(index)
+        return "break"
+
+    def _on_group_entry_confirm(self, event=None):
+        typed = (self.group_var.get() or "").strip()
+        if not typed:
+            self.group_var.set("Todos")
+        if self.group_suggestions_frame.winfo_ismapped() and self.group_listbox.size() > 0:
+            sel = self.group_listbox.curselection()
+            label = self.group_listbox.get(sel[0]) if sel else self.group_listbox.get(0)
+            self.group_var.set(label)
+        elif typed and typed != "Todos":
+            matches = self._matching_group_labels(typed)
+            if len(matches) == 1:
+                self.group_var.set(matches[0])
+        self._hide_group_suggestions()
+        self._schedule_refresh()
+        return "break"
+
+    def _on_group_listbox_confirm(self, event=None):
+        sel = self.group_listbox.curselection()
+        if sel:
+            label = self.group_listbox.get(sel[0])
+        elif self.group_listbox.size() > 0:
+            label = self.group_listbox.get(0)
+        else:
+            return "break"
+        self.group_var.set(label)
+        self._hide_group_suggestions()
+        try:
+            self.group_entry.focus_set()
+            self.group_entry.icursor("end")
+        except Exception:
+            pass
+        self._schedule_refresh()
+        return "break"
+
+    def _matching_portador_labels(self, typed: str):
+        typed = (typed or "").strip().lower()
+        if not typed or typed == "todos":
+            return []
+        parts = [p for p in re.split(r"\s+", typed) if p]
+        labels = []
+        for label in self.all_portador_options_map.keys():
+            if label == "Todos":
+                continue
+            low = label.lower()
+            if all(p in low for p in parts):
+                labels.append(label)
+        return labels[:200]
+
+    def _show_portador_suggestions(self, labels):
+        if not labels:
+            self._hide_portador_suggestions()
+            return
+        self.portador_listbox.delete(0, "end")
+        for label in labels:
+            self.portador_listbox.insert("end", label)
+        self.portador_suggestions_frame.grid()
+        self.portador_listbox.selection_clear(0, "end")
+        self.portador_listbox.selection_set(0)
+        self.portador_listbox.activate(0)
+        self.portador_listbox.see(0)
+
+    def _hide_portador_suggestions(self):
+        self.portador_suggestions_frame.grid_remove()
+
+    def _on_portador_keyrelease(self, event=None):
+        keysym = getattr(event, "keysym", "")
+        if keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return None
+        if not (self.portador_var.get() or "").strip():
+            self.portador_var.set("Todos")
+            self._hide_portador_suggestions()
+            self._schedule_refresh()
+            return None
+        if self._portador_filter_job is not None:
+            try:
+                self.after_cancel(self._portador_filter_job)
+            except Exception:
+                pass
+        self._portador_filter_job = self.after(150, self._apply_portador_search)
+        return None
+
+    def _apply_portador_search(self):
+        self._portador_filter_job = None
+        typed = (self.portador_var.get() or "").strip()
+        if not typed or typed == "Todos":
+            self._hide_portador_suggestions()
+            return
+        self._show_portador_suggestions(self._matching_portador_labels(typed))
+
+    def _on_portador_focus_in(self, event=None):
+        typed = (self.portador_var.get() or "").strip()
+        if typed and typed != "Todos":
+            self._show_portador_suggestions(self._matching_portador_labels(typed))
+        return None
+
+    def _on_portador_focus_out(self, event=None):
+        self.after(120, self._hide_portador_suggestions)
+        if not (self.portador_var.get() or "").strip():
+            self.portador_var.set("Todos")
+        self._schedule_refresh()
+
+    def _on_portador_arrow_down(self, event=None):
+        if not self.portador_suggestions_frame.winfo_ismapped() or self.portador_listbox.size() == 0:
+            self._show_portador_suggestions(self._matching_portador_labels(self.portador_var.get()))
+        if not self.portador_suggestions_frame.winfo_ismapped() or self.portador_listbox.size() == 0:
+            return "break"
+        selection = self.portador_listbox.curselection()
+        index = selection[0] + 1 if selection else 0
+        if index >= self.portador_listbox.size():
+            index = self.portador_listbox.size() - 1
+        self.portador_listbox.selection_clear(0, "end")
+        self.portador_listbox.selection_set(index)
+        self.portador_listbox.activate(index)
+        self.portador_listbox.see(index)
+        return "break"
+
+    def _on_portador_arrow_up(self, event=None):
+        if not self.portador_suggestions_frame.winfo_ismapped() or self.portador_listbox.size() == 0:
+            return "break"
+        selection = self.portador_listbox.curselection()
+        index = selection[0] - 1 if selection else 0
+        if index < 0:
+            index = 0
+        self.portador_listbox.selection_clear(0, "end")
+        self.portador_listbox.selection_set(index)
+        self.portador_listbox.activate(index)
+        self.portador_listbox.see(index)
+        return "break"
+
+    def _on_portador_entry_confirm(self, event=None):
+        typed = (self.portador_var.get() or "").strip()
+        if not typed:
+            self.portador_var.set("Todos")
+        if self.portador_suggestions_frame.winfo_ismapped() and self.portador_listbox.size() > 0:
+            sel = self.portador_listbox.curselection()
+            label = self.portador_listbox.get(sel[0]) if sel else self.portador_listbox.get(0)
+            self.portador_var.set(label)
+        elif typed and typed != "Todos":
+            matches = self._matching_portador_labels(typed)
+            if len(matches) == 1:
+                self.portador_var.set(matches[0])
+        self._hide_portador_suggestions()
+        self._schedule_refresh()
+        return "break"
+
+    def _on_portador_listbox_confirm(self, event=None):
+        sel = self.portador_listbox.curselection()
+        if sel:
+            label = self.portador_listbox.get(sel[0])
+        elif self.portador_listbox.size() > 0:
+            label = self.portador_listbox.get(0)
+        else:
+            return "break"
+        self.portador_var.set(label)
+        self._hide_portador_suggestions()
+        try:
+            self.portador_entry.focus_set()
+            self.portador_entry.icursor("end")
+        except Exception:
+            pass
+        self._schedule_refresh()
+        return "break"
+
+    def _matching_customer_labels(self, typed: str):
+        typed = (typed or "").strip().lower()
+        if not typed or typed == "todos":
+            return []
+        parts = [p for p in re.split(r"\s+", typed) if p]
+        labels = []
+        for label in self.all_customer_options_map.keys():
+            if label == "Todos":
+                continue
+            low = label.lower()
+            if all(p in low for p in parts):
+                labels.append(label)
+        return labels[:200]
+
+    def _show_customer_suggestions(self, labels):
+        if not labels:
+            self._hide_customer_suggestions()
+            return
+        self.customer_listbox.delete(0, "end")
+        for label in labels:
+            self.customer_listbox.insert("end", label)
+        self.customer_suggestions_frame.grid()
+        self.customer_listbox.selection_clear(0, "end")
+        self.customer_listbox.selection_set(0)
+        self.customer_listbox.activate(0)
+        self.customer_listbox.see(0)
+
+    def _hide_customer_suggestions(self):
+        self.customer_suggestions_frame.grid_remove()
+
+    def _on_customer_keyrelease(self, event=None):
+        keysym = getattr(event, "keysym", "")
+        if keysym in ("Up", "Down", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return None
+        if not (self.customer_var.get() or "").strip():
+            self.customer_var.set("Todos")
+            self._hide_customer_suggestions()
+            self._schedule_refresh()
+            return None
+        if self._customer_filter_job is not None:
+            try:
+                self.after_cancel(self._customer_filter_job)
+            except Exception:
+                pass
+        self._customer_filter_job = self.after(150, self._apply_customer_search)
+        return None
+
+    def _apply_customer_search(self):
+        self._customer_filter_job = None
+        typed = (self.customer_var.get() or "").strip()
+        if not typed or typed == "Todos":
+            self._hide_customer_suggestions()
+            return
+        self._show_customer_suggestions(self._matching_customer_labels(typed))
+
+    def _on_customer_focus_in(self, event=None):
+        typed = (self.customer_var.get() or "").strip()
+        if typed and typed != "Todos":
+            self._show_customer_suggestions(self._matching_customer_labels(typed))
+        return None
+
+    def _on_customer_focus_out(self, event=None):
+        self.after(120, self._hide_customer_suggestions)
+        if not (self.customer_var.get() or "").strip():
+            self.customer_var.set("Todos")
+        self._schedule_refresh()
+        return None
+
+    def _on_customer_arrow_down(self, event=None):
+        if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
+            self._apply_customer_search()
+        if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
+            return "break"
+        selection = self.customer_listbox.curselection()
+        index = selection[0] + 1 if selection else 0
+        if index >= self.customer_listbox.size():
+            index = self.customer_listbox.size() - 1
+        self.customer_listbox.selection_clear(0, "end")
+        self.customer_listbox.selection_set(index)
+        self.customer_listbox.activate(index)
+        self.customer_listbox.see(index)
+        return "break"
+
+    def _on_customer_arrow_up(self, event=None):
+        if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
+            self._apply_customer_search()
+        if not self.customer_suggestions_frame.winfo_ismapped() or self.customer_listbox.size() == 0:
+            return "break"
+        selection = self.customer_listbox.curselection()
+        index = selection[0] - 1 if selection else 0
+        if index < 0:
+            index = 0
+        self.customer_listbox.selection_clear(0, "end")
+        self.customer_listbox.selection_set(index)
+        self.customer_listbox.activate(index)
+        self.customer_listbox.see(index)
+        return "break"
+
+    def _on_customer_entry_confirm(self, event=None):
+        typed = (self.customer_var.get() or "").strip()
+        if not typed:
+            self.customer_var.set("Todos")
+        if self.customer_suggestions_frame.winfo_ismapped() and self.customer_listbox.size() > 0:
+            selection = self.customer_listbox.curselection()
+            label = self.customer_listbox.get(selection[0]) if selection else self.customer_listbox.get(0)
+            self.customer_var.set(label)
+        elif typed and typed != "Todos":
+            matches = self._matching_customer_labels(typed)
+            if len(matches) == 1:
+                self.customer_var.set(matches[0])
+        self._hide_customer_suggestions()
+        self._schedule_refresh()
+        return "break"
+
+    def _on_customer_listbox_confirm(self, event=None):
+        selection = self.customer_listbox.curselection()
+        if selection:
+            label = self.customer_listbox.get(selection[0])
+        elif self.customer_listbox.size() > 0:
+            label = self.customer_listbox.get(0)
+        else:
+            return "break"
+        self.customer_var.set(label)
+        self._hide_customer_suggestions()
+        try:
+            self.customer_entry.focus_set()
+            self.customer_entry.icursor("end")
+        except Exception:
+            pass
+        self._schedule_refresh()
+        return "break"
+
+    def _parse_base_date(self):
+        return OpenInvoicesWindow._parse_date(self, self.base_date_var.get()) or date.today()
+
+    def _update_hint_text(self):
+        try:
+            before_days = int(self.days_before_var.get() or 0)
+        except Exception:
+            before_days = 0
+        try:
+            after_days = int(self.days_after_var.get() or 0)
+        except Exception:
+            after_days = 0
+        before_days = max(0, min(60, before_days))
+        after_days = max(0, min(60, after_days))
+        parts = []
+        if before_days > 0:
+            parts.append(f"{before_days} dia(s) antes do vencimento do boleto")
+        if after_days > 0:
+            parts.append(f"{after_days} dia(s) após o vencimento do boleto")
+        self.mode_hint_label.configure(text=("Alerta: envia quando o boleto estiver em " + " ou ".join(parts) + ".") if parts else "Defina os dias antes/depois do vencimento para montar o alerta.")
+
+    def _schedule_refresh(self):
+        self._update_hint_text()
+        try:
+            if hasattr(self, "_auto_refresh_job") and self._auto_refresh_job:
+                self.after_cancel(self._auto_refresh_job)
+        except Exception:
+            pass
+        self._auto_refresh_job = self.after(250, self.refresh_preview)
+
+    def refresh_preview(self):
+        if self._preview_loading:
+            self._preview_pending = True
+            return
+        try:
+            base_date = self._parse_base_date()
+            group_id = self._selected_group_id()
+            portador_id = self._selected_portador_id()
+            customer_id = self._selected_customer_id()
+            try:
+                before_days = int(self.days_before_var.get() or 0)
+            except Exception:
+                before_days = 0
+            try:
+                after_days = int(self.days_after_var.get() or 0)
+            except Exception:
+                after_days = 0
+        except Exception as e:
+            self.status_var.set("Falha ao carregar dados.")
+            messagebox.showerror(APP_TITLE, f"Erro ao atualizar alerta:\n\n{e}", parent=self)
+            return
+
+        before_days = max(0, min(60, before_days))
+        after_days = max(0, min(60, after_days))
+        due_dates = []
+        if before_days > 0:
+            due_dates.append(base_date + timedelta(days=before_days))
+        if after_days > 0:
+            due_dates.append(base_date - timedelta(days=after_days))
+        due_dates = sorted({d for d in due_dates})
+
+        if not due_dates:
+            self.status_var.set("Defina os dias antes/depois do vencimento para visualizar a prévia.")
+            for it in self.tree.get_children():
+                self.tree.delete(it)
+            self._preview_rows = []
+            self._preview_base_date = base_date
+            return
+
+        self._preview_loading = True
+
+        def _work():
+            rows: List[Dict[str, Any]] = []
+            db = Database(self.config_data)
+            for d in due_dates:
+                rows.extend(db.list_agenda_invoices(d, group_id=group_id, portador_id=portador_id, customer_id=customer_id))
+
+            def _status_label(vencto: date) -> str:
+                diff = (vencto - base_date).days
+                if diff == 0:
+                    return "Vence hoje"
+                if diff > 0:
+                    return f"Vence em {diff} dia(s)"
+                return f"Vencido há {abs(diff)} dia(s)"
+
+            grouped: Dict[Any, Dict[str, Any]] = {}
+            for r in rows:
+                cid = r.get("customer_id")
+                key = cid if cid not in (None, "", 0, "0") else f"sem_{r.get('cliente')}"
+                item = grouped.get(key)
+                if not item:
+                    item = {"cliente": str(r.get("cliente") or "").strip(), "grupo": str(r.get("customer_group_name") or "").strip(), "email": str(r.get("customer_email") or "").strip(), "situacoes": set(), "titulos": 0, "total": 0.0, "portador": set()}
+                    grouped[key] = item
+                item["titulos"] += 1
+                try:
+                    item["total"] += float(r.get("saldo_em_aberto") or 0)
+                except Exception:
+                    pass
+                vd = r.get("vencto")
+                if isinstance(vd, date):
+                    item["situacoes"].add(f"{_status_label(vd)} ({vd.strftime('%d/%m/%Y')})")
+                pname = str(r.get("portador_nome") or "").strip()
+                if pname:
+                    item["portador"].add(pname)
+
+            items = list(grouped.values())
+            items.sort(key=lambda x: (x["cliente"] or "").lower())
+            total_sum = sum(float(it.get("total") or 0) for it in items)
+            dd_txt = " / ".join([d.strftime("%d/%m/%Y") for d in due_dates])
+            return {"rows": rows, "items": items, "total_sum": total_sum, "dd_txt": dd_txt}
+
+        def _ok(payload):
+            self._preview_loading = False
+            rows = payload.get("rows") or []
+            items = payload.get("items") or []
+            for it in self.tree.get_children():
+                self.tree.delete(it)
+            for it in items:
+                portador_txt = ", ".join(sorted(it.get("portador") or [])) if it.get("portador") else ""
+                sset = sorted(list(it.get("situacoes") or []))
+                situacao_txt = sset[0] if len(sset) == 1 else ("Múltiplos vencimentos" if sset else "")
+                self.tree.insert("", "end", values=(it.get("cliente") or "", it.get("grupo") or "", it.get("email") or "", situacao_txt, it.get("titulos") or 0, money_br(it.get("total") or 0), portador_txt))
+            self.status_var.set(f"{len(items)} cliente(s). Total previsto: {money_br(payload.get('total_sum') or 0)}. Datas-alvo: {payload.get('dd_txt')}")
+            self._preview_rows = rows
+            self._preview_base_date = base_date
+            if self._preview_pending:
+                self._preview_pending = False
+                self.refresh_preview()
+
+        def _err(e: Exception):
+            self._preview_loading = False
+            self.status_var.set("Falha ao carregar dados.")
+            messagebox.showerror(APP_TITLE, f"Erro ao atualizar alerta:\n\n{e}", parent=self)
+            if self._preview_pending:
+                self._preview_pending = False
+
+        run_with_busy(self, "Carregando prévia...", _work, _ok, _err)
+
+    def _get_extra_body(self) -> str:
+        return str(getattr(self, "_extra_body_value", "") or "")
+
+    def _alert_settings_payload(self) -> Dict[str, Any]:
+        group_id = self._selected_group_id()
+        portador_id = self._selected_portador_id()
+        customer_id = self._selected_customer_id()
+        try:
+            before_days = int(self.days_before_var.get() or 0)
+        except Exception:
+            before_days = 0
+        try:
+            after_days = int(self.days_after_var.get() or 0)
+        except Exception:
+            after_days = 0
+        return {
+            "id": (self.agenda_id or ""),
+            "name": str(self.name_var.get() or "").strip() or "Alerta de vencimento",
+            "enabled": bool(self.enabled_var.get()),
+            "send_time": str(self.send_time_var.get() or "06:00").strip() or "06:00",
+            "send_pix_qrcode": bool(self.send_pix_qrcode_var.get()),
+            "days_before_due": max(0, min(365, before_days)),
+            "days_after_due": max(0, min(365, after_days)),
+            "group_id": group_id,
+            "portador_id": portador_id,
+            "customer_id": customer_id,
+            "extra_body": self._get_extra_body(),
+        }
+
+    def save_settings(self):
+        payload = self._alert_settings_payload()
+        agendas = self.config_data.get("financeiro_agendas", []) or []
+        if not isinstance(agendas, list):
+            agendas = []
+        updated = False
+        if payload["id"]:
+            for i, a in enumerate(agendas):
+                if isinstance(a, dict) and str(a.get("id") or "") == str(payload["id"]):
+                    last_run_date = str(a.get("last_run_date") or "")
+                    last_run_at = str(a.get("last_run_at") or "")
+                    last_due_date = str(a.get("last_due_date") or "")
+                    last_result = a.get("last_result") if isinstance(a.get("last_result"), dict) else {}
+                    merged = dict(a)
+                    merged.update(payload)
+                    merged["last_run_date"] = last_run_date
+                    merged["last_run_at"] = last_run_at
+                    merged["last_due_date"] = last_due_date
+                    merged["last_result"] = last_result
+                    agendas[i] = merged
+                    updated = True
+                    break
+        if not updated:
+            payload["id"] = payload["id"] or str(len(agendas) + 1)
+            agendas.append(payload)
+        self.config_data["financeiro_agendas"] = agendas
+        ConfigManager.save(self.config_data)
+        self.config_data = ConfigManager.load()
+        messagebox.showinfo(APP_TITLE, "Alerta salvo com sucesso.", parent=self)
+        self.on_config_saved(self.config_data)
+        self._close()
+
+    def simulate_now(self):
+        try:
+            base_date = self._parse_base_date()
+            group_id = self._selected_group_id()
+            portador_id = self._selected_portador_id()
+            customer_id = self._selected_customer_id()
+            try:
+                before_days = int(self.days_before_var.get() or 0)
+            except Exception:
+                before_days = 0
+            try:
+                after_days = int(self.days_after_var.get() or 0)
+            except Exception:
+                after_days = 0
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Erro ao preparar simulação:\n\n{e}", parent=self)
+            return
+
+        before_days = max(0, min(60, before_days))
+        after_days = max(0, min(60, after_days))
+        due_dates = []
+        if before_days > 0:
+            due_dates.append(base_date + timedelta(days=before_days))
+        if after_days > 0:
+            due_dates.append(base_date - timedelta(days=after_days))
+        due_dates = sorted({d for d in due_dates})
+        if not due_dates:
+            messagebox.showinfo(APP_TITLE, "Defina os dias antes/depois do vencimento para simular.", parent=self)
+            return
+
+        def _work():
+            rows: List[Dict[str, Any]] = []
+            db = Database(self.config_data)
+            for d in due_dates:
+                rows.extend(db.list_agenda_invoices(d, group_id=group_id, portador_id=portador_id, customer_id=customer_id))
+            return rows
+
+        def _ok(rows):
+            rows = rows or []
+            if not rows:
+                messagebox.showinfo(APP_TITLE, "Nenhum título encontrado para as regras atuais.", parent=self)
+                return
+            messagebox.showinfo(APP_TITLE, f"{len(rows)} título(s) encontrado(s) para envio.", parent=self)
+
+        def _err(e: Exception):
+            messagebox.showerror(APP_TITLE, f"Erro ao simular alerta:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Simulando alerta...", _work, _ok, _err)
+
+    def _send_for_rows_grouped(self, rows: List[Dict[str, Any]], dry_run: bool = False, base_date: Optional[date] = None):
+        base_date = base_date or date.today()
+        smtp_cfg = self.config_data.get("smtp", {})
+        smtp_email = str(smtp_cfg.get("email", "")).strip()
+        smtp_host = str(smtp_cfg.get("host", "")).strip()
+        smtp_password = str(smtp_cfg.get("password", "")).strip()
+        smtp_port = int(smtp_cfg.get("port", 587) or 587)
+        if not smtp_email or not smtp_host or not smtp_password or not smtp_port:
+            raise AppError("SMTP não configurado.")
+
+        def _send_smtp_message(msg: EmailMessage):
+            if smtp_port == 465:
+                context = ssl.create_default_context()
+                with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=20) as server:
+                    server.login(smtp_email, smtp_password)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                    server.ehlo()
+                    try:
+                        server.starttls(context=ssl.create_default_context())
+                        server.ehlo()
+                    except Exception:
+                        pass
+                    server.login(smtp_email, smtp_password)
+                    server.send_message(msg)
+
+        invoices: List[InvoiceRow] = []
+        for r in rows:
+            invoices.append(
+                InvoiceRow(
+                    invoice_id=r.get("movto_id"),
+                    company=str(r.get("empresa") or "").strip(),
+                    customer_id=r.get("customer_id"),
+                    customer_code=r.get("codigo_cliente"),
+                    customer_name=str(r.get("cliente") or "").strip(),
+                    motive_code="",
+                    motive_name="",
+                    account_code=str(r.get("conta") or "").strip(),
+                    account_name=str(r.get("conta_nome") or "").strip(),
+                    issue_date=r.get("data"),
+                    due_date=r.get("vencto"),
+                    amount=r.get("valor"),
+                    discount_amount=r.get("valor_desconto"),
+                    paid_amount=r.get("valor_baixado"),
+                    open_balance=r.get("saldo_em_aberto"),
+                    customer_email=str(r.get("customer_email") or "").strip(),
+                )
+            )
+
+        invoice_ids = [i.invoice_id for i in invoices if i.invoice_id not in (None, "", 0, "0")]
+        boleto_map: Dict[Any, Dict[str, Any]] = {}
+        try:
+            boleto_map = Database(self.config_data).get_boletos_email_payload_bulk(invoice_ids)
+        except Exception:
+            boleto_map = {}
+
+        signature_map: Dict[Any, Dict[str, Any]] = {}
+        try:
+            signature_map = Database(self.config_data).get_sale_signatures_pdf_bulk(invoice_ids)
+        except Exception:
+            signature_map = {}
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for inv in invoices:
+            cid = inv.customer_id
+            key = str(cid) if cid not in (None, "", 0, "0") else (inv.customer_email or inv.customer_name or str(inv.customer_code))
+            item = grouped.get(key)
+            if not item:
+                item = {"customer_id": cid, "customer_name": inv.customer_name, "customer_email": inv.customer_email, "invoices": []}
+                grouped[key] = item
+            item["invoices"].append(inv)
+
+        emails_sent = 0
+        skipped_no_email = 0
+        failed = 0
+        attachments_total = 0
+        missing_total = 0
+        include_pix_qrcode = bool(self.send_pix_qrcode_var.get())
+        try:
+            delay_seconds = int(smtp_cfg.get("delay_seconds", 5) or 0)
+        except Exception:
+            delay_seconds = 5
+        delay_seconds = max(0, min(300, delay_seconds))
+        first_email = True
+        for g in grouped.values():
+            invs: List[InvoiceRow] = g.get("invoices") or []
+            if not invs:
+                continue
+            to_email = (g.get("customer_email") or "").strip()
+            if not to_email and g.get("customer_id") not in (None, "", 0, "0"):
+                try:
+                    to_email = Database(self.config_data).get_customer_email(g.get("customer_id"))
+                except Exception:
+                    to_email = ""
+            if not to_email:
+                skipped_no_email += 1
+                continue
+
+            attachments: List[Tuple[bytes, str]] = []
+            missing = 0
+            for inv in invs:
+                boleto_data = boleto_map.get(inv.invoice_id) or {}
+                try:
+                    if boleto_data.get("exists"):
+                        attachment_data = boleto_data.get("attachment_data")
+                        filename = boleto_data.get("filename") or f"boleto_{inv.invoice_id}.pdf"
+                        data = None
+                        if include_pix_qrcode and attachment_data:
+                            try:
+                                data = bytes(attachment_data)
+                            except Exception:
+                                data = None
+                        if not data:
+                            try:
+                                data = build_boleto_pdf_bytes(boleto_data, inv, include_pix_qrcode=include_pix_qrcode)
+                            except Exception:
+                                data = None
+                                if attachment_data:
+                                    try:
+                                        data = bytes(attachment_data)
+                                    except Exception:
+                                        data = None
+                        if data:
+                            attachments.append((data, filename))
+                        else:
+                            missing += 1
+                    else:
+                        missing += 1
+                except Exception:
+                    missing += 1
+                sig = signature_map.get(inv.invoice_id) or {}
+                sig_added = False
+                for a in (sig.get("attachments") or []):
+                    sdata = a.get("data")
+                    sname = a.get("filename")
+                    if sdata and sname:
+                        attachments.append((sdata, sname))
+                        sig_added = True
+                sig_bytes = sig.get("attachment_data")
+                if not sig_added and sig.get("exists") and sig_bytes:
+                    attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+            attachments_total += len(attachments)
+            missing_total += missing
+
+            if dry_run:
+                continue
+
+            purchase_map = {}
+            try:
+                invoice_ids = [inv.invoice_id for inv in invs if inv.invoice_id not in (None, "", 0, "0")]
+                purchase_map = Database(self.config_data).get_purchase_info_bulk(invoice_ids)
+            except Exception:
+                purchase_map = {}
+            text_body, html_body = build_due_alert_email_body(invs[0].customer_name, base_date, invs, missing, self._get_extra_body(), purchase_info_map=purchase_map)
+            subject = f"Alerta de vencimento de boleto - {invs[0].customer_name}"
+
+            max_attachments = 18
+            max_bytes = 15 * 1024 * 1024
+            batches: List[List[Tuple[bytes, str]]] = []
+            current: List[Tuple[bytes, str]] = []
+            current_bytes = 0
+            for data, name in attachments:
+                size = len(data) if data else 0
+                if current and (len(current) >= max_attachments or (current_bytes + size) > max_bytes):
+                    batches.append(current)
+                    current = []
+                    current_bytes = 0
+                current.append((data, name))
+                current_bytes += size
+            if current or not attachments:
+                batches.append(current)
+
+            for idx, batch in enumerate(batches, start=1):
+                if not first_email and delay_seconds > 0:
+                    time_module.sleep(delay_seconds)
+                first_email = False
+                msg = EmailMessage()
+                msg["From"] = smtp_email
+                msg["To"] = to_email
+                msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
+                msg.set_content(text_body)
+                msg.add_alternative(html_body, subtype="html")
+                for data, name in batch:
+                    if not data:
+                        continue
+                    maintype, subtype = _mime_parts_from_filename(name)
+                    msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+                try:
+                    _send_smtp_message(msg)
+                    emails_sent += 1
+                    AuditLogger.write(self.current_user, "alerta_envio_email", f"alerta_id={self.agenda_id};cliente={invs[0].customer_name};para={to_email};titulos={len(invs)};anexos={len(batch)};pix_incluido_no_boleto={'sim' if include_pix_qrcode else 'nao'}")
+                except Exception as e:
+                    failed += 1
+                    AuditLogger.write(self.current_user, "alerta_envio_email_erro", f"alerta_id={self.agenda_id};cliente={invs[0].customer_name};para={to_email};erro={e}")
+
+        return {"emails_sent": emails_sent, "skipped_no_email": skipped_no_email, "failed": failed, "attachments_total": attachments_total, "missing_total": missing_total}
+
+    def send_now(self):
+        if self._send_thread and getattr(self._send_thread, "is_alive", lambda: False)():
+            messagebox.showwarning(APP_TITLE, "O envio já está em andamento.", parent=self)
+            return
+        try:
+            base_date = self._parse_base_date()
+            group_id = self._selected_group_id()
+            portador_id = self._selected_portador_id()
+            customer_id = self._selected_customer_id()
+            try:
+                before_days = int(self.days_before_var.get() or 0)
+            except Exception:
+                before_days = 0
+            try:
+                after_days = int(self.days_after_var.get() or 0)
+            except Exception:
+                after_days = 0
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Erro ao preparar envio:\n\n{e}", parent=self)
+            return
+
+        before_days = max(0, min(60, before_days))
+        after_days = max(0, min(60, after_days))
+        due_dates = []
+        if before_days > 0:
+            due_dates.append(base_date + timedelta(days=before_days))
+        if after_days > 0:
+            due_dates.append(base_date - timedelta(days=after_days))
+        due_dates = sorted({d for d in due_dates})
+        if not due_dates:
+            messagebox.showinfo(APP_TITLE, "Defina os dias antes/depois do vencimento para enviar.", parent=self)
+            return
+
+        def _work():
+            rows: List[Dict[str, Any]] = []
+            db = Database(self.config_data)
+            for d in due_dates:
+                rows.extend(db.list_agenda_invoices(d, group_id=group_id, portador_id=portador_id, customer_id=customer_id))
+            if not rows:
+                return {"empty": True}
+            res = self._send_for_rows_grouped(rows, dry_run=False, base_date=base_date)
+            return {"empty": False, "result": res}
+
+        def _ok(payload):
+            if payload.get("empty"):
+                messagebox.showinfo(APP_TITLE, "Nenhum título encontrado para as regras atuais.", parent=self)
+                return
+            result = payload.get("result") or {}
+            sent = int(result.get("emails_sent") or 0)
+            skipped = int(result.get("skipped_no_email") or 0)
+            failed = int(result.get("failed") or 0)
+            messagebox.showinfo(APP_TITLE, f"Envio concluído.\n\nEnviados: {sent}\nSem e-mail: {skipped}\nFalhas: {failed}", parent=self)
+
+        def _err(e: Exception):
+            messagebox.showerror(APP_TITLE, f"Erro no envio:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Enviando alertas...", _work, _ok, _err)
+
+    def _close(self):
+        self.destroy()
+
+
+class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
+    def __init__(self, master, config_data: Dict[str, Any], current_user: str, on_config_saved):
+        super().__init__(master)
+        self.master_app = master
+        self.config_data = deepcopy(config_data)
+        self.current_user = current_user
+        self.on_config_saved = on_config_saved
+        self._run_thread = None
+        self.status_var = tk.StringVar(value="Pronto.")
+        self.enabled_var = tk.BooleanVar(value=False)
+        self.interval_var = tk.StringVar(value="4")
+        self.no_email_retry_var = tk.StringVar(value="24")
+        self.batch_size_var = tk.StringVar(value="2000")
+        self.last_scan_var = tk.StringVar(value="")
+        self.last_run_var = tk.StringVar(value="")
+        self.last_result_var = tk.StringVar(value="")
+        self.title(f"{APP_TITLE} - Envio automático de documentos")
+        self.geometry("980x560")
+        self.minsize(820, 520)
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._build_ui()
+        self._center_window()
+        self._load_from_config()
+
+    def _center_window(self):
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - self.winfo_width()) // 2
+        y = (sh - self.winfo_height()) // 2
+        self.geometry(f"+{max(x, 20)}+{max(y, 20)}")
+
+    def _auto_cfg(self) -> Dict[str, Any]:
+        cfg = self.config_data.get("financeiro_envio_auto_documentos")
+        if not isinstance(cfg, dict):
+            cfg = {}
+            self.config_data["financeiro_envio_auto_documentos"] = cfg
+        return cfg
+
+    def _load_from_config(self):
+        cfg = self._auto_cfg()
+        self.enabled_var.set(bool(cfg.get("enabled", False)))
+        self.interval_var.set(str(cfg.get("interval_hours") or 4).strip() or "4")
+        self.no_email_retry_var.set(str(cfg.get("no_email_retry_hours") or 24).strip() or "24")
+        self.batch_size_var.set(str(cfg.get("pending_batch_size") or 2000).strip() or "2000")
+        self.last_scan_var.set(str(cfg.get("last_scan_end") or "").strip())
+        self.last_run_var.set(str(cfg.get("last_run_at") or "").strip())
+        lr = cfg.get("last_result") if isinstance(cfg.get("last_result"), dict) else {}
+        if lr:
+            self.last_result_var.set(
+                f"docs_encontrados={lr.get('discovered')} pendentes_antes={lr.get('pending_before')} emails_planejados={lr.get('emails_planned')} emails_enviados={lr.get('emails_sent')} falhas_email={lr.get('failed_emails')} docs_enviados={lr.get('docs_sent')} docs_falha={lr.get('docs_failed')} sem_email={lr.get('docs_no_email')}"
+            )
+        else:
+            self.last_result_var.set("")
+        self.extra_text.delete("1.0", "end")
+        self.extra_text.insert("1.0", str(cfg.get("extra_body") or ""))
+
+    def _persist(self):
+        cfg = self._auto_cfg()
+        cfg["enabled"] = bool(self.enabled_var.get())
+        try:
+            cfg["interval_hours"] = max(1, min(72, int(str(self.interval_var.get() or "").strip() or 4)))
+        except Exception:
+            cfg["interval_hours"] = 4
+        try:
+            cfg["no_email_retry_hours"] = max(1, min(24 * 30, int(str(self.no_email_retry_var.get() or "").strip() or 24)))
+        except Exception:
+            cfg["no_email_retry_hours"] = 24
+        try:
+            cfg["pending_batch_size"] = max(50, min(5000, int(str(self.batch_size_var.get() or "").strip() or 2000)))
+        except Exception:
+            cfg["pending_batch_size"] = 2000
+        cfg["extra_body"] = self.extra_text.get("1.0", "end").strip()
+        self.config_data["financeiro_envio_auto_documentos"] = cfg
+        ConfigManager.save(self.config_data)
+        self.config_data = ConfigManager.load()
+        self.on_config_saved(self.config_data)
+
+    def _save(self):
+        try:
+            self._persist()
+            self.status_var.set("Configurações salvas.")
+            self._load_from_config()
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Erro ao salvar:\n\n{e}", parent=self)
+
+    def _open_app_folder(self):
+        try:
+            from app_core.constants import app_dir
+            os.startfile(str(app_dir()))
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Falha ao abrir pasta:\n\n{e}", parent=self)
+
+    def _run(self, dry_run: bool):
+        if self._run_thread is not None and getattr(self._run_thread, "is_alive", lambda: False)():
+            return
+
+        def _work():
+            from app_core.auto_documents import run_auto_documents
+            payload = deepcopy(self.config_data) if dry_run else self.config_data
+            return run_auto_documents(payload, dry_run=dry_run, user_label=self.current_user)
+
+        def _ok(res):
+            if not dry_run:
+                try:
+                    self._persist()
+                except Exception:
+                    pass
+            self._load_from_config()
+            self.status_var.set("Concluído.")
+            title = "Simulação concluída" if dry_run else "Execução concluída"
+            messagebox.showinfo(APP_TITLE, f"{title}.\n\n{res}", parent=self)
+
+        def _err(e: Exception):
+            self.status_var.set("Falha.")
+            messagebox.showerror(APP_TITLE, f"Erro:\n\n{e}", parent=self)
+
+        self.status_var.set("Processando...")
+        self._run_thread = threading.Thread(target=lambda: run_with_busy(self, "Processando...", _work, _ok, _err), daemon=True)
+        self._run_thread.start()
+
+    def _simulate(self):
+        self._run(True)
+
+    def _run_now(self):
+        if not messagebox.askyesno(APP_TITLE, "Deseja executar o envio agora?", parent=self):
+            return
+        self._run(False)
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(16, 12, 16, 0))
+        header.pack(fill="x")
+        ttk.Label(header, text="Envio automático de documentos", font=("Segoe UI", 14, "bold"), foreground="#2563eb").pack(side="left")
+
+        top = ttk.Frame(self, padding=(12, 10, 12, 10))
+        top.pack(fill="x")
+        ttk.Button(top, text="Salvar", command=self._save).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Simular", command=self._simulate).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Executar agora", command=self._run_now).pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="Abrir pasta do app", command=self._open_app_folder).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Voltar ao início", command=self._close).pack(side="right")
+
+        body = ttk.Frame(self, padding=(12, 0, 12, 10))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(3, weight=1)
+
+        ttk.Checkbutton(body, text="Ativar envio automático", variable=self.enabled_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(body, text="Intervalo (horas)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Entry(body, textvariable=self.interval_var, width=12).grid(row=1, column=1, sticky="w", pady=5)
+
+        adv = ttk.Frame(body)
+        adv.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(adv, text="Retentar sem e-mail (h)").pack(side="left")
+        ttk.Entry(adv, textvariable=self.no_email_retry_var, width=8).pack(side="left", padx=(8, 16))
+        ttk.Label(adv, text="Lote pendências").pack(side="left")
+        ttk.Entry(adv, textvariable=self.batch_size_var, width=10).pack(side="left", padx=(8, 0))
+
+        extra_box = ttk.LabelFrame(body, text="Texto extra do e-mail", padding=10)
+        extra_box.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        extra_box.rowconfigure(0, weight=1)
+        extra_box.columnconfigure(0, weight=1)
+        self.extra_text = tk.Text(extra_box, wrap="word", height=8)
+        self.extra_text.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(extra_box, orient="vertical", command=self.extra_text.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.extra_text.configure(yscrollcommand=vsb.set)
+
+        info = ttk.LabelFrame(body, text="Última execução", padding=10)
+        info.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        info.columnconfigure(1, weight=1)
+        ttk.Label(info, text="Último scan até").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(info, textvariable=self.last_scan_var).grid(row=0, column=1, sticky="w", pady=4)
+        ttk.Label(info, text="Última execução").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(info, textvariable=self.last_run_var).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(info, text="Resultado").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(info, textvariable=self.last_result_var, wraplength=820, justify="left").grid(row=2, column=1, sticky="w", pady=4)
+
+        bottom = ttk.Frame(self, padding=(12, 0, 12, 10))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
+        ttk.Label(bottom, text=f"Usuário: {self.current_user}").pack(side="right")
+
+    def _close(self):
+        self.destroy()
+
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.title(APP_TITLE)
         self.title(APP_TITLE)
         self.geometry("460x300")
         self.minsize(460, 300)
@@ -1907,6 +4643,13 @@ class MainApp(tk.Tk):
         self.login_message_var = tk.StringVar(value="")
         self.inactive_window: Optional[InactiveCustomersWindow] = None
         self.invoices_window: Optional[OpenInvoicesWindow] = None
+        self.alerts_window: Optional[FinanceiroAlertasWindow] = None
+        self.envio_docs_window: Optional[FinanceiroEnvioAutomaticoDocumentosWindow] = None
+        self._financeiro_alert_after_id = None
+        self._financeiro_alert_running: set[str] = set()
+        self._financeiro_alert_attempted: Dict[str, str] = {}
+        self._auto_docs_after_id = None
+        self._auto_docs_running = False
         self._setup_style()
         self._build_menu()
         self._build_frames()
@@ -1935,6 +4678,8 @@ class MainApp(tk.Tk):
         menubar.add_cascade(label="Cadastro", menu=self.cadastro_menu)
         self.financeiro_menu = tk.Menu(menubar, tearoff=0)
         self.financeiro_menu.add_command(label="Faturas a receber", command=self.open_invoices_screen)
+        self.financeiro_menu.add_command(label="Envio automático de documentos", command=self.open_financeiro_envio_docs_screen)
+        self.financeiro_menu.add_command(label="Alertas de vencimento", command=self.open_financeiro_alertas_screen)
         menubar.add_cascade(label="Financeiro", menu=self.financeiro_menu)
         self.config_menu = tk.Menu(menubar, tearoff=0)
         self.config_menu.add_command(label="Configuração local", command=self.open_config)
@@ -1950,6 +4695,8 @@ class MainApp(tk.Tk):
         self.cadastro_menu.entryconfig("Clientes inativos", state=logged_state)
         self.config_menu.entryconfig("Configuração local", state=logged_state)
         self.financeiro_menu.entryconfig("Faturas a receber", state=logged_state)
+        self.financeiro_menu.entryconfig("Envio automático de documentos", state=logged_state)
+        self.financeiro_menu.entryconfig("Alertas de vencimento", state=logged_state)
     def _build_frames(self):
         self.login_frame = ttk.Frame(self, padding=24)
         self.setup_user_frame = ttk.Frame(self, padding=24)
@@ -2089,6 +4836,8 @@ class MainApp(tk.Tk):
         self.geometry("900x520")
         self.minsize(700, 420)
         self.show_home()
+        self._start_financeiro_alert_loop()
+        self._start_auto_docs_loop()
     def _create_first_user(self):
         try:
             username = self.first_user_entry.get().strip()
@@ -2125,6 +4874,8 @@ class MainApp(tk.Tk):
         self.geometry("900x520")
         self.minsize(700, 420)
         self.show_home()
+        self._start_financeiro_alert_loop()
+        self._start_auto_docs_loop()
     def open_create_user(self):
         if not self.current_user:
             return
@@ -2165,6 +4916,399 @@ class MainApp(tk.Tk):
             self.invoices_window.focus_force()
             return
         self.invoices_window = OpenInvoicesWindow(self, self.config_data, self.current_user, self._apply_new_config)
+
+    def open_financeiro_alertas_screen(self):
+        if not self.current_user:
+            return
+        if self.alerts_window is not None and self.alerts_window.winfo_exists():
+            self.alerts_window.deiconify()
+            self.alerts_window.lift()
+            self.alerts_window.focus_force()
+            return
+        self.alerts_window = FinanceiroAlertasWindow(self, self.config_data, self.current_user, self._apply_new_config)
+
+    def open_financeiro_envio_docs_screen(self):
+        if not self.current_user:
+            return
+        if self.envio_docs_window is not None and self.envio_docs_window.winfo_exists():
+            self.envio_docs_window.deiconify()
+            self.envio_docs_window.lift()
+            self.envio_docs_window.focus_force()
+            return
+        self.envio_docs_window = FinanceiroEnvioAutomaticoDocumentosWindow(self, self.config_data, self.current_user, self._apply_new_config)
+
+    def _start_financeiro_alert_loop(self):
+        if self._financeiro_alert_after_id:
+            try:
+                self.after_cancel(self._financeiro_alert_after_id)
+            except Exception:
+                pass
+            self._financeiro_alert_after_id = None
+        self._financeiro_alert_after_id = self.after(2500, self._financeiro_alert_tick)
+
+    def _financeiro_alert_tick(self):
+        self._financeiro_alert_after_id = self.after(60 * 1000, self._financeiro_alert_tick)
+        if not self.current_user:
+            return
+        now = datetime.now()
+        today_key = date.today().isoformat()
+        agendas = self.config_data.get("financeiro_agendas", []) or []
+        if not isinstance(agendas, list) or not agendas:
+            return
+
+        def parse_time(value: str):
+            value = str(value or "").strip()
+            m = re.match(r"^(\d{1,2}):(\d{2})$", value)
+            if not m:
+                return time(6, 0)
+            hh = int(m.group(1))
+            mm = int(m.group(2))
+            if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+                return time(6, 0)
+            return time(hh, mm)
+
+        def send_for_alert(alert_id: str, alert_cfg: Dict[str, Any]):
+            started_at = datetime.now()
+            target_time = parse_time(alert_cfg.get("send_time"))
+            late_minutes = 0
+            try:
+                late_minutes = int((started_at - datetime.combine(started_at.date(), target_time)).total_seconds() // 60)
+                if late_minutes < 0:
+                    late_minutes = 0
+            except Exception:
+                late_minutes = 0
+            out_of_time = late_minutes > 15
+            include_pix_qrcode = bool(alert_cfg.get("send_pix_qrcode", False))
+            base_date = date.today()
+            try:
+                days_before = int(alert_cfg.get("days_before_due") or 0)
+            except Exception:
+                days_before = 0
+            try:
+                days_after = int(alert_cfg.get("days_after_due") or 0)
+            except Exception:
+                days_after = 0
+            days_before = max(0, min(365, days_before))
+            days_after = max(0, min(365, days_after))
+            due_dates = []
+            if days_before > 0:
+                due_dates.append(base_date + timedelta(days=days_before))
+            if days_after > 0:
+                due_dates.append(base_date - timedelta(days=days_after))
+            due_dates = sorted({d for d in due_dates})
+            due_dates_str = ",".join([d.isoformat() for d in due_dates])
+            try:
+                rows: List[Dict[str, Any]] = []
+                db = Database(self.config_data)
+                for d in due_dates:
+                    rows.extend(
+                        db.list_agenda_invoices(
+                            d,
+                            group_id=alert_cfg.get("group_id"),
+                            portador_id=alert_cfg.get("portador_id"),
+                            customer_id=alert_cfg.get("customer_id"),
+                        )
+                    )
+                extra_body = str(alert_cfg.get("extra_body") or "").strip()
+
+                smtp_cfg = self.config_data.get("smtp", {})
+                smtp_email = str(smtp_cfg.get("email", "")).strip()
+                smtp_host = str(smtp_cfg.get("host", "")).strip()
+                smtp_password = str(smtp_cfg.get("password", "")).strip()
+                smtp_port = int(smtp_cfg.get("port", 587) or 587)
+                if not smtp_email or not smtp_host or not smtp_password or not smtp_port:
+                    raise AppError("SMTP não configurado.")
+
+                def _send_smtp_message(msg: EmailMessage):
+                    if smtp_port == 465:
+                        context = ssl.create_default_context()
+                        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=20) as server:
+                            server.login(smtp_email, smtp_password)
+                            server.send_message(msg)
+                    else:
+                        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                            server.ehlo()
+                            try:
+                                server.starttls(context=ssl.create_default_context())
+                                server.ehlo()
+                            except Exception:
+                                pass
+                            server.login(smtp_email, smtp_password)
+                            server.send_message(msg)
+
+                invoices: List[InvoiceRow] = []
+                for r in rows:
+                    invoices.append(
+                        InvoiceRow(
+                            invoice_id=r.get("movto_id"),
+                            company=str(r.get("empresa") or "").strip(),
+                            customer_id=r.get("customer_id"),
+                            customer_code=r.get("codigo_cliente"),
+                            customer_name=str(r.get("cliente") or "").strip(),
+                            motive_code="",
+                            motive_name="",
+                            account_code=str(r.get("conta") or "").strip(),
+                            account_name=str(r.get("conta_nome") or "").strip(),
+                            issue_date=r.get("data"),
+                            due_date=r.get("vencto"),
+                            amount=r.get("valor"),
+                            discount_amount=r.get("valor_desconto"),
+                            paid_amount=r.get("valor_baixado"),
+                            open_balance=r.get("saldo_em_aberto"),
+                            customer_email=str(r.get("customer_email") or "").strip(),
+                        )
+                    )
+
+                invoice_ids = [i.invoice_id for i in invoices if i.invoice_id not in (None, "", 0, "0")]
+                boleto_map: Dict[Any, Dict[str, Any]] = {}
+                try:
+                    boleto_map = Database(self.config_data).get_boletos_email_payload_bulk(invoice_ids)
+                except Exception:
+                    boleto_map = {}
+
+                signature_map: Dict[Any, Dict[str, Any]] = {}
+                try:
+                    signature_map = Database(self.config_data).get_sale_signatures_pdf_bulk(invoice_ids)
+                except Exception:
+                    signature_map = {}
+
+                grouped: Dict[str, Dict[str, Any]] = {}
+                for inv in invoices:
+                    cid = inv.customer_id
+                    key = str(cid) if cid not in (None, "", 0, "0") else (inv.customer_email or inv.customer_name or str(inv.customer_code))
+                    item = grouped.get(key)
+                    if not item:
+                        item = {"customer_id": cid, "customer_name": inv.customer_name, "customer_email": inv.customer_email, "invoices": []}
+                        grouped[key] = item
+                    item["invoices"].append(inv)
+
+                emails_planned = 0
+                emails_sent = 0
+                skipped_no_email = 0
+                failed = 0
+                attachments_total = 0
+                missing_total = 0
+                try:
+                    delay_seconds = int(smtp_cfg.get("delay_seconds", 5) or 0)
+                except Exception:
+                    delay_seconds = 5
+                delay_seconds = max(0, min(300, delay_seconds))
+                first_email = True
+                for g in grouped.values():
+                    invs: List[InvoiceRow] = g.get("invoices") or []
+                    if not invs:
+                        continue
+                    to_email = (g.get("customer_email") or "").strip()
+                    if not to_email and g.get("customer_id") not in (None, "", 0, "0"):
+                        try:
+                            to_email = Database(self.config_data).get_customer_email(g.get("customer_id"))
+                        except Exception:
+                            to_email = ""
+                    if not to_email:
+                        skipped_no_email += 1
+                        continue
+
+                    attachments: List[Tuple[bytes, str]] = []
+                    missing = 0
+                    for inv in invs:
+                        boleto_data = boleto_map.get(inv.invoice_id) or {}
+                        try:
+                            if boleto_data.get("exists"):
+                                attachment_data = boleto_data.get("attachment_data")
+                                filename = boleto_data.get("filename") or f"boleto_{inv.invoice_id}.pdf"
+                                data = None
+                                if include_pix_qrcode and attachment_data:
+                                    try:
+                                        data = bytes(attachment_data)
+                                    except Exception:
+                                        data = None
+                                if not data:
+                                    try:
+                                        data = build_boleto_pdf_bytes(boleto_data, inv, include_pix_qrcode=include_pix_qrcode)
+                                    except Exception:
+                                        data = None
+                                        if attachment_data:
+                                            try:
+                                                data = bytes(attachment_data)
+                                            except Exception:
+                                                data = None
+                                if data:
+                                    attachments.append((data, filename))
+                                else:
+                                    missing += 1
+                            else:
+                                missing += 1
+                        except Exception:
+                            missing += 1
+                        sig = signature_map.get(inv.invoice_id) or {}
+                        sig_added = False
+                        for a in (sig.get("attachments") or []):
+                            sdata = a.get("data")
+                            sname = a.get("filename")
+                            if sdata and sname:
+                                attachments.append((sdata, sname))
+                                sig_added = True
+                        sig_bytes = sig.get("attachment_data")
+                        if not sig_added and sig.get("exists") and sig_bytes:
+                            attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+
+                    emails_planned += 1
+                    attachments_total += len(attachments)
+                    missing_total += missing
+                    purchase_map = {}
+                    try:
+                        invoice_ids = [inv.invoice_id for inv in invs if inv.invoice_id not in (None, "", 0, "0")]
+                        purchase_map = Database(self.config_data).get_purchase_info_bulk(invoice_ids)
+                    except Exception:
+                        purchase_map = {}
+                    text_body, html_body = build_due_alert_email_body(invs[0].customer_name, base_date, invs, missing, extra_body, purchase_info_map=purchase_map)
+                    subject = f"Alerta de vencimento de boleto - {invs[0].customer_name}"
+
+                    max_attachments = 18
+                    max_bytes = 15 * 1024 * 1024
+                    batches: List[List[Tuple[bytes, str]]] = []
+                    current: List[Tuple[bytes, str]] = []
+                    current_bytes = 0
+                    for data, name in attachments:
+                        size = len(data) if data else 0
+                        if current and (len(current) >= max_attachments or (current_bytes + size) > max_bytes):
+                            batches.append(current)
+                            current = []
+                            current_bytes = 0
+                        current.append((data, name))
+                        current_bytes += size
+                    if current or not attachments:
+                        batches.append(current)
+
+                    for idx, batch in enumerate(batches, start=1):
+                        if not first_email and delay_seconds > 0:
+                            time_module.sleep(delay_seconds)
+                        first_email = False
+                        msg = EmailMessage()
+                        msg["From"] = smtp_email
+                        msg["To"] = to_email
+                        msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
+                        msg.set_content(text_body)
+                        msg.add_alternative(html_body, subtype="html")
+                        for data, name in batch:
+                            if not data:
+                                continue
+                            maintype, subtype = _mime_parts_from_filename(name)
+                            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+                        try:
+                            _send_smtp_message(msg)
+                            emails_sent += 1
+                            AuditLogger.write(self.current_user, "alerta_envio_email_auto", f"alerta_id={alert_id};cliente={invs[0].customer_name};para={to_email};titulos={len(invs)};anexos={len(batch)};pix_incluido_no_boleto={'sim' if include_pix_qrcode else 'nao'}")
+                        except Exception as e:
+                            failed += 1
+                            AuditLogger.write(self.current_user, "alerta_envio_email_auto_erro", f"alerta_id={alert_id};cliente={invs[0].customer_name};para={to_email};erro={e}")
+
+                updated = False
+                new_agendas = []
+                for a in (self.config_data.get("financeiro_agendas", []) or []):
+                    if isinstance(a, dict) and str(a.get("id") or "") == str(alert_id):
+                        merged = dict(a)
+                        merged["last_run_date"] = today_key
+                        merged["last_run_at"] = started_at.isoformat(timespec="seconds")
+                        merged["last_due_date"] = due_dates_str
+                        merged["last_late_minutes"] = late_minutes
+                        merged["last_out_of_time"] = bool(out_of_time)
+                        merged["last_result"] = {"emails_sent": emails_sent, "skipped_no_email": skipped_no_email, "failed": failed, "attachments_total": attachments_total, "missing_total": missing_total, "emails_planned": emails_planned}
+                        new_agendas.append(merged)
+                        updated = True
+                    else:
+                        new_agendas.append(a)
+                if updated:
+                    self.config_data["financeiro_agendas"] = new_agendas
+                    ConfigManager.save(self.config_data)
+                    self.config_data = ConfigManager.load()
+                AuditLogger.write(self.current_user, "alerta_execucao", f"alerta_id={alert_id};due_dates={due_dates_str};enviados={emails_sent};sem_email={skipped_no_email};falhas={failed};atraso_min={late_minutes}")
+            except Exception as e:
+                AuditLogger.write(self.current_user, "alerta_execucao_erro", f"alerta_id={alert_id};erro={e}")
+            finally:
+                try:
+                    self._financeiro_alert_running.discard(str(alert_id))
+                except Exception:
+                    pass
+
+        for a in agendas:
+            if not isinstance(a, dict):
+                continue
+            if not a.get("enabled"):
+                continue
+            alert_id = str(a.get("id") or "")
+            if not alert_id:
+                continue
+            if alert_id in self._financeiro_alert_running:
+                continue
+            if str(self._financeiro_alert_attempted.get(alert_id) or "") == today_key:
+                continue
+            if str(a.get("last_run_date") or "").strip() == today_key:
+                continue
+            target_time = parse_time(a.get("send_time"))
+            if now.time() < target_time:
+                continue
+            self._financeiro_alert_running.add(alert_id)
+            self._financeiro_alert_attempted[alert_id] = today_key
+            threading.Thread(target=send_for_alert, args=(alert_id, dict(a)), daemon=True).start()
+
+    def _start_auto_docs_loop(self):
+        if self._auto_docs_after_id:
+            try:
+                self.after_cancel(self._auto_docs_after_id)
+            except Exception:
+                pass
+            self._auto_docs_after_id = None
+        self._auto_docs_after_id = self.after(5000, self._auto_docs_tick)
+
+    def _auto_docs_tick(self):
+        self._auto_docs_after_id = self.after(60 * 1000, self._auto_docs_tick)
+        if not self.current_user:
+            return
+        if self._auto_docs_running:
+            return
+        try:
+            self.config_data = ConfigManager.load()
+        except Exception:
+            pass
+        auto_cfg = self.config_data.get("financeiro_envio_auto_documentos")
+        if not isinstance(auto_cfg, dict) or not auto_cfg.get("enabled"):
+            return
+        try:
+            interval_hours = int(auto_cfg.get("interval_hours") or 4)
+        except Exception:
+            interval_hours = 4
+        interval_hours = max(1, min(72, interval_hours))
+        last_run_at_raw = str(auto_cfg.get("last_run_at") or "").strip()
+        if last_run_at_raw:
+            try:
+                last_run_at_dt = datetime.fromisoformat(last_run_at_raw)
+                if (datetime.now() - last_run_at_dt) < timedelta(hours=interval_hours):
+                    return
+            except Exception:
+                pass
+
+        def _run():
+            self._auto_docs_running = True
+            try:
+                from app_core.auto_documents import run_auto_documents
+                res = run_auto_documents(self.config_data, dry_run=False, user_label=f"auto:{self.current_user}")
+                ConfigManager.save(self.config_data)
+                self.config_data = ConfigManager.load()
+                AuditLogger.write(
+                    self.current_user,
+                    "auto_docs_execucao",
+                    f"emails_enviados={res.get('emails_sent')};falhas_email={res.get('failed_emails')};docs_enviados={res.get('docs_sent')};docs_falha={res.get('docs_failed')};sem_email={res.get('docs_no_email')}",
+                )
+            except Exception as e:
+                try:
+                    AuditLogger.write(self.current_user, "auto_docs_execucao_erro", f"erro={e}")
+                except Exception:
+                    pass
+            finally:
+                self._auto_docs_running = False
+
+        threading.Thread(target=_run, daemon=True).start()
     def _apply_security_config(self, cfg: Dict[str, Any]):
         self.config_data = ConfigManager.load()
     def _apply_new_config(self, cfg: Dict[str, Any]):
@@ -2174,7 +5318,11 @@ class MainApp(tk.Tk):
             messagebox.showerror(APP_TITLE, str(e), parent=self)
             return
         self.config_data = cfg
+        self._start_financeiro_alert_loop()
+        self._start_auto_docs_loop()
 def main():
+    from app_core.logging_setup import init_logging
+    init_logging()
     app = MainApp()
     app.mainloop()
 if __name__ == "__main__":

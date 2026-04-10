@@ -56,6 +56,7 @@ class InvoiceRow:
     paid_amount: Any = 0
     open_balance: Any = 0
     customer_email: str = ""
+    movto_id: Any = None
 
     def issue_date_display(self) -> str:
         value = self.issue_date

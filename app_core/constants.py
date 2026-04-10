@@ -12,40 +12,47 @@ MASTER_USERNAME = "databrev"
 MASTER_PASSWORD = "270810"
 
 DEFAULT_LIST_SQL = """
-select
-    c.grid as customer_id,
-    pessoa_nome_f(l.empresa) as last_purchase_company,
-    c.codigo as customer_code,
-    c.nome as customer_name,
-    coalesce(co.nome, 'Sem conta') as account_name,
-    max(case when pc.pessoa is not null then 1 else 0 end) as has_account,
-    coalesce(pc.lim_credito, 0) as credit_limit,
-    max(l.data) as last_purchase_date,
-    case c.flag
-        when 'A' then 'Ativo'
-        when 'I' then 'Inativo'
-        when 'D' then 'Deletado'
-        else coalesce(c.flag, '')
-    end as customer_status
-from cliente c
-join lancto l
-    on l.pessoa = c.grid
-left join pessoa_conta pc
-    on pc.pessoa = c.grid
-left join conta co
-    on co.codigo = pc.conta
-where l.operacao = 'V'
-group by
+WITH last_purchase AS (
+    SELECT DISTINCT ON (l.pessoa)
+        l.pessoa AS customer_id,
+        l.empresa AS last_company_id,
+        l.data AS last_purchase_date
+    FROM lancto l
+    WHERE l.operacao = 'V'
+    ORDER BY l.pessoa, l.data DESC
+)
+SELECT
+    c.grid AS customer_id,
+    pessoa_nome_f(lp.last_company_id) AS last_purchase_company,
+    c.codigo AS customer_code,
+    c.nome AS customer_name,
+    COALESCE(co.nome, 'Sem conta') AS account_name,
+    MAX(CASE WHEN pc.pessoa IS NOT NULL THEN 1 ELSE 0 END) AS has_account,
+    COALESCE(MAX(pc.lim_credito), 0) AS credit_limit,
+    lp.last_purchase_date,
+    CASE c.flag
+        WHEN 'A' THEN 'Ativo'
+        WHEN 'I' THEN 'Inativo'
+        WHEN 'D' THEN 'Deletado'
+        ELSE COALESCE(c.flag, '')
+    END AS customer_status
+FROM cliente c
+JOIN last_purchase lp
+  ON lp.customer_id = c.grid
+LEFT JOIN pessoa_conta pc
+  ON pc.pessoa = c.grid
+LEFT JOIN conta co
+  ON co.codigo = pc.conta
+WHERE lp.last_purchase_date < current_date - interval '3 months'
+GROUP BY
     c.grid,
-    l.empresa,
+    lp.last_company_id,
+    lp.last_purchase_date,
     c.codigo,
     c.nome,
-    coalesce(co.nome, 'Sem conta'),
-    coalesce(pc.lim_credito, 0),
-    c.flag,
-    pessoa_nome_f(l.empresa)
-having max(l.data) < current_date - interval '3 months'
-order by pessoa_nome_f(l.empresa), max(l.data)
+    COALESCE(co.nome, 'Sem conta'),
+    c.flag
+ORDER BY lp.last_purchase_date
 """
 
 DEFAULT_OPEN_INVOICES_SQL = """
@@ -77,10 +84,10 @@ WITH titulos AS (
     JOIN pessoa p
       ON p.grid = m.pessoa
     WHERE m.pessoa IS NOT NULL
-      AND m.vencto <= current_date
       AND COALESCE(m.valor, 0) > 0
       AND m.child = 0
       AND m.conta_debitar LIKE '1.3.04%'
+      AND EXISTS (SELECT 1 FROM boleto b2 WHERE b2.movto = m.grid)
 )
 SELECT
     movto_id,
@@ -119,6 +126,7 @@ DEFAULT_CONFIG = {
         "password": "6UBwERuJiqJi",
         "port": 465
     },
+    "financeiro_agendas": [],
     "queries": {
         "list_inactive_customers_sql": DEFAULT_LIST_SQL,
         "list_open_invoices_sql": DEFAULT_OPEN_INVOICES_SQL,

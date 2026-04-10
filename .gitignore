@@ -7,3 +7,5 @@ dist/
 *.zip
 *.exe
 *.key
+*.sqlite3
+*.gz

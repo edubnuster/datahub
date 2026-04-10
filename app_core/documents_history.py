@@ -1,0 +1,296 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from .constants import app_dir
+
+
+def _iso(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ""
+    try:
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return str(dt)
+
+
+@dataclass(frozen=True)
+class DocumentRecord:
+    boleto_grid: str
+    movto_id: str
+    customer_id: str
+    customer_email: str
+    documento: str
+    generated_at: str
+    status: str
+    last_attempt_at: str
+    sent_at: str
+    error: str
+
+
+class DocumentsHistory:
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path or (app_dir() / "envio_documentos.sqlite3")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    boleto_grid TEXT PRIMARY KEY,
+                    movto_id TEXT,
+                    customer_id TEXT,
+                    customer_email TEXT,
+                    documento TEXT,
+                    generated_at TEXT,
+                    status TEXT,
+                    last_attempt_at TEXT,
+                    sent_at TEXT,
+                    error TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_generated_at ON documents(generated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_movto_id ON documents(movto_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_documento ON documents(documento)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_customer_id ON documents(customer_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    status TEXT,
+                    window_start TEXT,
+                    window_end TEXT,
+                    result_json TEXT
+                )
+                """
+            )
+            conn.commit()
+
+    def start_run(self, window_start: datetime, window_end: datetime) -> int:
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO runs(started_at, finished_at, status, window_start, window_end, result_json) VALUES (?,?,?,?,?,?)",
+                (_iso(datetime.now()), "", "running", _iso(window_start), _iso(window_end), ""),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def finish_run(self, run_id: int, status: str, result: Dict[str, Any]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET finished_at=?, status=?, result_json=? WHERE id=?",
+                (_iso(datetime.now()), str(status or ""), json.dumps(result or {}, ensure_ascii=False), int(run_id)),
+            )
+            conn.commit()
+
+    def upsert_generated(self, row: Dict[str, Any]) -> None:
+        boleto_grid = str(row.get("boleto_grid") or "").strip()
+        if not boleto_grid:
+            return
+        movto_id = str(row.get("movto_id") or "").strip()
+        customer_id = str(row.get("customer_id") or "").strip()
+        customer_email = str(row.get("customer_email") or "").strip()
+        documento = str(row.get("documento") or "").strip()
+        generated_at = str(row.get("generated_at") or "").strip()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT status FROM documents WHERE boleto_grid=?",
+                (boleto_grid,),
+            ).fetchone()
+            if existing and str(existing[0] or "").strip().lower() == "sent":
+                return
+            if not existing and movto_id:
+                already_sent = conn.execute(
+                    "SELECT boleto_grid FROM documents WHERE movto_id=? AND status='sent' LIMIT 1",
+                    (movto_id,),
+                ).fetchone()
+                if already_sent:
+                    conn.execute(
+                        """
+                        INSERT INTO documents(
+                            boleto_grid, movto_id, customer_id, customer_email, documento, generated_at,
+                            status, last_attempt_at, sent_at, error
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            boleto_grid,
+                            movto_id,
+                            customer_id,
+                            customer_email,
+                            documento,
+                            generated_at,
+                            "skipped_duplicate",
+                            _iso(datetime.now()),
+                            "",
+                            f"Já enviado anteriormente para este movto_id (grid={str(already_sent[0] or '').strip()}).",
+                        ),
+                    )
+                    conn.commit()
+                    return
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE documents
+                       SET movto_id=?, customer_id=?, customer_email=?, documento=?, generated_at=?
+                     WHERE boleto_grid=?
+                    """,
+                    (movto_id, customer_id, customer_email, documento, generated_at, boleto_grid),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO documents(
+                        boleto_grid, movto_id, customer_id, customer_email, documento, generated_at,
+                        status, last_attempt_at, sent_at, error
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (boleto_grid, movto_id, customer_id, customer_email, documento, generated_at, "pending", "", "", ""),
+                )
+            conn.commit()
+
+    def list_pending(self, limit: int = 500) -> List[DocumentRecord]:
+        limit = max(1, min(5000, int(limit or 500)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT boleto_grid, movto_id, customer_id, customer_email, documento, generated_at, status, last_attempt_at, sent_at, error
+                  FROM documents
+                 WHERE status IN ('pending','failed')
+                 ORDER BY generated_at, boleto_grid
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        out: List[DocumentRecord] = []
+        for r in rows:
+            out.append(
+                DocumentRecord(
+                    boleto_grid=str(r[0] or ""),
+                    movto_id=str(r[1] or ""),
+                    customer_id=str(r[2] or ""),
+                    customer_email=str(r[3] or ""),
+                    documento=str(r[4] or ""),
+                    generated_at=str(r[5] or ""),
+                    status=str(r[6] or ""),
+                    last_attempt_at=str(r[7] or ""),
+                    sent_at=str(r[8] or ""),
+                    error=str(r[9] or ""),
+                )
+            )
+        return out
+
+    def list_retryable(self, *, limit: int = 500, no_email_retry_hours: int = 24) -> List[DocumentRecord]:
+        limit = max(1, min(5000, int(limit or 500)))
+        no_email_retry_hours = max(1, min(24 * 30, int(no_email_retry_hours or 24)))
+        cutoff = _iso(datetime.now() - timedelta(hours=no_email_retry_hours))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT boleto_grid, movto_id, customer_id, customer_email, documento, generated_at, status, last_attempt_at, sent_at, error
+                  FROM documents
+                 WHERE status IN ('pending','failed')
+                    OR (status='no_email' AND (last_attempt_at='' OR last_attempt_at < ?))
+                 ORDER BY generated_at, boleto_grid
+                 LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+        out: List[DocumentRecord] = []
+        for r in rows:
+            out.append(
+                DocumentRecord(
+                    boleto_grid=str(r[0] or ""),
+                    movto_id=str(r[1] or ""),
+                    customer_id=str(r[2] or ""),
+                    customer_email=str(r[3] or ""),
+                    documento=str(r[4] or ""),
+                    generated_at=str(r[5] or ""),
+                    status=str(r[6] or ""),
+                    last_attempt_at=str(r[7] or ""),
+                    sent_at=str(r[8] or ""),
+                    error=str(r[9] or ""),
+                )
+            )
+        return out
+
+    def mark_sent(self, boleto_grids: Iterable[str], to_email: str) -> None:
+        now = _iso(datetime.now())
+        to_email = str(to_email or "").strip()
+        values = [(str(g or "").strip(),) for g in (boleto_grids or []) if str(g or "").strip()]
+        if not values:
+            return
+        with self._connect() as conn:
+            for (g,) in values:
+                conn.execute(
+                    """
+                    UPDATE documents
+                       SET status='sent', last_attempt_at=?, sent_at=?, customer_email=COALESCE(NULLIF(customer_email,''), ?), error=''
+                     WHERE boleto_grid=?
+                    """,
+                    (now, now, to_email, g),
+                )
+            conn.commit()
+
+    def mark_no_email(self, boleto_grids: Iterable[str]) -> None:
+        now = _iso(datetime.now())
+        values = [(str(g or "").strip(),) for g in (boleto_grids or []) if str(g or "").strip()]
+        if not values:
+            return
+        with self._connect() as conn:
+            for (g,) in values:
+                conn.execute(
+                    "UPDATE documents SET status='no_email', last_attempt_at=?, error='' WHERE boleto_grid=?",
+                    (now, g),
+                )
+            conn.commit()
+
+    def mark_failed(self, boleto_grids: Iterable[str], error: str) -> None:
+        now = _iso(datetime.now())
+        error = str(error or "").strip()
+        values = [(str(g or "").strip(),) for g in (boleto_grids or []) if str(g or "").strip()]
+        if not values:
+            return
+        with self._connect() as conn:
+            for (g,) in values:
+                conn.execute(
+                    "UPDATE documents SET status='failed', last_attempt_at=?, error=? WHERE boleto_grid=?",
+                    (now, error[:2000], g),
+                )
+            conn.commit()
+
+    def mark_closed(self, boleto_grids: Iterable[str]) -> None:
+        now = _iso(datetime.now())
+        values = [(str(g or "").strip(),) for g in (boleto_grids or []) if str(g or "").strip()]
+        if not values:
+            return
+        with self._connect() as conn:
+            for (g,) in values:
+                conn.execute(
+                    "UPDATE documents SET status='closed', last_attempt_at=?, error='' WHERE boleto_grid=?",
+                    (now, g),
+                )
+            conn.commit()
+
+    def vacuum(self) -> None:
+        with self._connect() as conn:
+            conn.execute("VACUUM")
+

@@ -30,13 +30,24 @@ class ConfigManager:
         merged["smtp"].setdefault("password", "6UBwERuJiqJi")
         merged["smtp"].setdefault("port", 465)
 
+        merged.setdefault("financeiro_agendas", [])
+
         current_sql = merged.get("queries", {}).get("list_inactive_customers_sql", "") or ""
         current_sql_lower = current_sql.lower()
+        must_reset_inactive_sql = False
         if (
             "left join pessoa_conta" not in current_sql_lower
             or "credit_limit" not in current_sql
             or "has_account" not in current_sql_lower
         ):
+            must_reset_inactive_sql = True
+        if (
+            "having max(l.data)" in current_sql_lower
+            or "order by pessoa_nome_f(l.empresa)" in current_sql_lower
+            or ("group by" in current_sql_lower and "pessoa_nome_f(l.empresa)" in current_sql_lower)
+        ):
+            must_reset_inactive_sql = True
+        if must_reset_inactive_sql:
             merged["queries"]["list_inactive_customers_sql"] = DEFAULT_LIST_SQL
 
         invoices_sql = merged.get("queries", {}).get("list_open_invoices_sql", "") or ""
@@ -55,6 +66,10 @@ class ConfigManager:
 
         if "m.conta_debitar like '1.3.04%'" not in invoices_sql_lower:
             must_reset_invoices_sql = True
+        if "exists (select 1 from boleto" not in invoices_sql_lower:
+            must_reset_invoices_sql = True
+        if "m.vencto <= current_date" in invoices_sql_lower:
+            must_reset_invoices_sql = True
 
         if must_reset_invoices_sql:
             merged["queries"]["list_open_invoices_sql"] = DEFAULT_OPEN_INVOICES_SQL
@@ -66,6 +81,37 @@ class ConfigManager:
         disable_sql = (merged.get("queries", {}).get("disable_credit_sql") or "").strip().lower()
         if not disable_sql or "update conta" in disable_sql:
             merged["queries"]["disable_credit_sql"] = DEFAULT_CONFIG["queries"]["disable_credit_sql"]
+
+        normalized_agendas = []
+        agendas = merged.get("financeiro_agendas", []) or []
+        if isinstance(agendas, list):
+            for a in agendas:
+                if not isinstance(a, dict):
+                    continue
+                agenda = dict(a)
+                agenda.setdefault("id", str(len(normalized_agendas) + 1))
+                agenda.setdefault("name", "Alerta de vencimento")
+                agenda["enabled"] = bool(agenda.get("enabled", False))
+                agenda["send_time"] = str(agenda.get("send_time") or "06:00").strip() or "06:00"
+                try:
+                    agenda["days_before_due"] = max(0, min(365, int(agenda.get("days_before_due", 5) or 5)))
+                except Exception:
+                    agenda["days_before_due"] = 5
+                try:
+                    agenda["days_after_due"] = max(0, min(365, int(agenda.get("days_after_due", 0) or 0)))
+                except Exception:
+                    agenda["days_after_due"] = 0
+                agenda["group_id"] = agenda.get("group_id")
+                agenda["portador_id"] = agenda.get("portador_id")
+                agenda["customer_id"] = agenda.get("customer_id")
+                agenda["extra_body"] = str(agenda.get("extra_body") or "")
+                agenda["last_run_date"] = str(agenda.get("last_run_date") or "")
+                agenda["last_run_at"] = str(agenda.get("last_run_at") or "")
+                agenda["last_due_date"] = str(agenda.get("last_due_date") or "")
+                agenda["last_late_minutes"] = int(agenda.get("last_late_minutes") or 0)
+                agenda["last_out_of_time"] = bool(agenda.get("last_out_of_time", False))
+                normalized_agendas.append(agenda)
+        merged["financeiro_agendas"] = normalized_agendas
 
         return merged
 
