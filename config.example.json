@@ -1,0 +1,22 @@
+{
+    "connection": {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "dbname": "",
+        "user": "postgres",
+        "password": "",
+        "client_encoding": "LATIN1"
+    },
+    "security": {
+        "users": []
+    },
+    "smtp": {
+        "email": "",
+        "sender_name": "",
+        "host": "",
+        "password": "",
+        "port": 587,
+        "delay_seconds": 5
+    },
+    "financeiro_agendas": []
+}

@@ -26,6 +26,7 @@ class DocumentRecord:
     movto_id: str
     customer_id: str
     customer_email: str
+    customer_name: str
     documento: str
     generated_at: str
     status: str
@@ -55,6 +56,7 @@ class DocumentsHistory:
                     movto_id TEXT,
                     customer_id TEXT,
                     customer_email TEXT,
+                    customer_name TEXT,
                     documento TEXT,
                     generated_at TEXT,
                     status TEXT,
@@ -64,6 +66,10 @@ class DocumentsHistory:
                 )
                 """
             )
+            try:
+                conn.execute("ALTER TABLE documents ADD COLUMN customer_name TEXT")
+            except Exception:
+                pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_generated_at ON documents(generated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_movto_id ON documents(movto_id)")
@@ -102,13 +108,14 @@ class DocumentsHistory:
             )
             conn.commit()
 
-    def upsert_generated(self, row: Dict[str, Any]) -> None:
+    def upsert_generated(self, row: Dict[str, Any], *, allow_duplicate: bool = False) -> str:
         boleto_grid = str(row.get("boleto_grid") or "").strip()
         if not boleto_grid:
-            return
+            return "ignored"
         movto_id = str(row.get("movto_id") or "").strip()
         customer_id = str(row.get("customer_id") or "").strip()
         customer_email = str(row.get("customer_email") or "").strip()
+        customer_name = str(row.get("cliente") or row.get("customer_name") or "").strip()
         documento = str(row.get("documento") or "").strip()
         generated_at = str(row.get("generated_at") or "").strip()
         with self._connect() as conn:
@@ -116,9 +123,10 @@ class DocumentsHistory:
                 "SELECT status FROM documents WHERE boleto_grid=?",
                 (boleto_grid,),
             ).fetchone()
-            if existing and str(existing[0] or "").strip().lower() == "sent":
-                return
-            if not existing and movto_id:
+            existing_status = str(existing[0] or "").strip().lower() if existing else ""
+            if existing and existing_status == "sent" and not allow_duplicate:
+                return "kept_sent"
+            if not allow_duplicate and not existing and movto_id:
                 already_sent = conn.execute(
                     "SELECT boleto_grid FROM documents WHERE movto_id=? AND status='sent' LIMIT 1",
                     (movto_id,),
@@ -127,15 +135,16 @@ class DocumentsHistory:
                     conn.execute(
                         """
                         INSERT INTO documents(
-                            boleto_grid, movto_id, customer_id, customer_email, documento, generated_at,
+                            boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at,
                             status, last_attempt_at, sent_at, error
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
                             boleto_grid,
                             movto_id,
                             customer_id,
                             customer_email,
+                            customer_name,
                             documento,
                             generated_at,
                             "skipped_duplicate",
@@ -145,36 +154,37 @@ class DocumentsHistory:
                         ),
                     )
                     conn.commit()
-                    return
+                    return "skipped_duplicate"
             if existing:
                 conn.execute(
                     """
                     UPDATE documents
-                       SET movto_id=?, customer_id=?, customer_email=?, documento=?, generated_at=?
+                       SET movto_id=?, customer_id=?, customer_email=?, customer_name=?, documento=?, generated_at=?, status=CASE WHEN ? THEN 'pending' ELSE status END, error=CASE WHEN ? THEN '' ELSE error END
                      WHERE boleto_grid=?
                     """,
-                    (movto_id, customer_id, customer_email, documento, generated_at, boleto_grid),
+                    (movto_id, customer_id, customer_email, customer_name, documento, generated_at, bool(allow_duplicate), bool(allow_duplicate), boleto_grid),
                 )
             else:
                 conn.execute(
                     """
                     INSERT INTO documents(
-                        boleto_grid, movto_id, customer_id, customer_email, documento, generated_at,
+                        boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at,
                         status, last_attempt_at, sent_at, error
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (boleto_grid, movto_id, customer_id, customer_email, documento, generated_at, "pending", "", "", ""),
+                    (boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, "pending", "", "", ""),
                 )
             conn.commit()
+        return "pending"
 
     def list_pending(self, limit: int = 500) -> List[DocumentRecord]:
         limit = max(1, min(5000, int(limit or 500)))
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT boleto_grid, movto_id, customer_id, customer_email, documento, generated_at, status, last_attempt_at, sent_at, error
+                SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
                   FROM documents
-                 WHERE status IN ('pending','failed')
+                 WHERE status = 'pending'
                  ORDER BY generated_at, boleto_grid
                  LIMIT ?
                 """,
@@ -188,12 +198,48 @@ class DocumentsHistory:
                     movto_id=str(r[1] or ""),
                     customer_id=str(r[2] or ""),
                     customer_email=str(r[3] or ""),
-                    documento=str(r[4] or ""),
-                    generated_at=str(r[5] or ""),
-                    status=str(r[6] or ""),
-                    last_attempt_at=str(r[7] or ""),
-                    sent_at=str(r[8] or ""),
-                    error=str(r[9] or ""),
+                    customer_name=str(r[4] or ""),
+                    documento=str(r[5] or ""),
+                    generated_at=str(r[6] or ""),
+                    status=str(r[7] or ""),
+                    last_attempt_at=str(r[8] or ""),
+                    sent_at=str(r[9] or ""),
+                    error=str(r[10] or ""),
+                )
+            )
+        return out
+
+    def list_pending_by_grids(self, boleto_grids: Iterable[str]) -> List[DocumentRecord]:
+        grids = [str(g or "").strip() for g in (boleto_grids or []) if str(g or "").strip()]
+        if not grids:
+            return []
+        if len(grids) > 900:
+            grids = grids[:900]
+        placeholders = ",".join(["?"] * len(grids))
+        sql = f"""
+            SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
+              FROM documents
+             WHERE status = 'pending'
+               AND boleto_grid IN ({placeholders})
+             ORDER BY generated_at, boleto_grid
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(grids)).fetchall()
+        out: List[DocumentRecord] = []
+        for r in rows:
+            out.append(
+                DocumentRecord(
+                    boleto_grid=str(r[0] or ""),
+                    movto_id=str(r[1] or ""),
+                    customer_id=str(r[2] or ""),
+                    customer_email=str(r[3] or ""),
+                    customer_name=str(r[4] or ""),
+                    documento=str(r[5] or ""),
+                    generated_at=str(r[6] or ""),
+                    status=str(r[7] or ""),
+                    last_attempt_at=str(r[8] or ""),
+                    sent_at=str(r[9] or ""),
+                    error=str(r[10] or ""),
                 )
             )
         return out
@@ -232,6 +278,136 @@ class DocumentsHistory:
             )
         return out
 
+    def list_problems(self) -> List[DocumentRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
+                  FROM documents
+                 WHERE status IN ('failed', 'no_email')
+                 ORDER BY last_attempt_at DESC
+                 LIMIT 1000
+                """
+            ).fetchall()
+        out: List[DocumentRecord] = []
+        for r in rows:
+            out.append(
+                DocumentRecord(
+                    boleto_grid=str(r[0] or ""),
+                    movto_id=str(r[1] or ""),
+                    customer_id=str(r[2] or ""),
+                    customer_email=str(r[3] or ""),
+                    customer_name=str(r[4] or ""),
+                    documento=str(r[5] or ""),
+                    generated_at=str(r[6] or ""),
+                    status=str(r[7] or ""),
+                    last_attempt_at=str(r[8] or ""),
+                    sent_at=str(r[9] or ""),
+                    error=str(r[10] or ""),
+                )
+            )
+        return out
+
+    def list_sent(self, limit: int = 1000) -> List[DocumentRecord]:
+        limit = max(1, min(5000, int(limit or 1000)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
+                  FROM documents
+                 WHERE status = 'sent'
+                 ORDER BY sent_at DESC, boleto_grid
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        out: List[DocumentRecord] = []
+        for r in rows:
+            out.append(
+                DocumentRecord(
+                    boleto_grid=str(r[0] or ""),
+                    movto_id=str(r[1] or ""),
+                    customer_id=str(r[2] or ""),
+                    customer_email=str(r[3] or ""),
+                    customer_name=str(r[4] or ""),
+                    documento=str(r[5] or ""),
+                    generated_at=str(r[6] or ""),
+                    status=str(r[7] or ""),
+                    last_attempt_at=str(r[8] or ""),
+                    sent_at=str(r[9] or ""),
+                    error=str(r[10] or ""),
+                )
+            )
+        return out
+
+    def list_sent_by_grids(self, boleto_grids: Iterable[str]) -> Dict[str, DocumentRecord]:
+        grids = [str(g or "").strip() for g in (boleto_grids or []) if str(g or "").strip()]
+        if not grids:
+            return {}
+        if len(grids) > 900:
+            grids = grids[:900]
+        placeholders = ",".join(["?"] * len(grids))
+        sql = f"""
+            SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
+              FROM documents
+             WHERE status = 'sent'
+               AND boleto_grid IN ({placeholders})
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(grids)).fetchall()
+        out: Dict[str, DocumentRecord] = {}
+        for r in rows:
+            rec = DocumentRecord(
+                boleto_grid=str(r[0] or ""),
+                movto_id=str(r[1] or ""),
+                customer_id=str(r[2] or ""),
+                customer_email=str(r[3] or ""),
+                customer_name=str(r[4] or ""),
+                documento=str(r[5] or ""),
+                generated_at=str(r[6] or ""),
+                status=str(r[7] or ""),
+                last_attempt_at=str(r[8] or ""),
+                sent_at=str(r[9] or ""),
+                error=str(r[10] or ""),
+            )
+            if rec.boleto_grid:
+                out[rec.boleto_grid] = rec
+        return out
+
+    def list_sent_by_movto_ids(self, movto_ids: Iterable[str]) -> Dict[str, DocumentRecord]:
+        ids = [str(g or "").strip() for g in (movto_ids or []) if str(g or "").strip()]
+        if not ids:
+            return {}
+        if len(ids) > 900:
+            ids = ids[:900]
+        placeholders = ",".join(["?"] * len(ids))
+        sql = f"""
+            SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
+              FROM documents
+             WHERE status = 'sent'
+               AND movto_id IN ({placeholders})
+        """
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(ids)).fetchall()
+        out: Dict[str, DocumentRecord] = {}
+        for r in rows:
+            rec = DocumentRecord(
+                boleto_grid=str(r[0] or ""),
+                movto_id=str(r[1] or ""),
+                customer_id=str(r[2] or ""),
+                customer_email=str(r[3] or ""),
+                customer_name=str(r[4] or ""),
+                documento=str(r[5] or ""),
+                generated_at=str(r[6] or ""),
+                status=str(r[7] or ""),
+                last_attempt_at=str(r[8] or ""),
+                sent_at=str(r[9] or ""),
+                error=str(r[10] or ""),
+            )
+            if rec.movto_id:
+                out[rec.movto_id] = rec
+        return out
+
     def mark_sent(self, boleto_grids: Iterable[str], to_email: str) -> None:
         now = _iso(datetime.now())
         to_email = str(to_email or "").strip()
@@ -247,6 +423,18 @@ class DocumentsHistory:
                      WHERE boleto_grid=?
                     """,
                     (now, now, to_email, g),
+                )
+            conn.commit()
+
+    def reset_to_pending(self, boleto_grids: Iterable[str]) -> None:
+        values = [(str(g or "").strip(),) for g in (boleto_grids or []) if str(g or "").strip()]
+        if not values:
+            return
+        with self._connect() as conn:
+            for (g,) in values:
+                conn.execute(
+                    "UPDATE documents SET status='pending', last_attempt_at='', sent_at='', error='' WHERE boleto_grid=?",
+                    (g,),
                 )
             conn.commit()
 

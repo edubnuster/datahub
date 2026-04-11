@@ -11,8 +11,9 @@ import ssl
 from typing import Any, Dict, List, Optional, Tuple
 
 from .database import Database
+from .danfe import danfe_pdf_from_nfe_xml
 from .documents_history import DocumentsHistory
-from .helpers import AppError
+from .helpers import AppError, format_smtp_from
 from .models import InvoiceRow
 from .logging_setup import get_docs_generated_logger, get_docs_sent_logger, get_system_logger
 
@@ -32,6 +33,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
     if ext == "pdf":
         return "application", "pdf"
+    if ext == "xml":
+        return "application", "xml"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -66,19 +69,23 @@ def _smtp_send_message(cfg: Dict[str, Any], msg: EmailMessage) -> None:
             server.send_message(msg)
 
 
-def _generate_boleto_pdf_if_needed(boleto_data: Dict[str, Any], inv: InvoiceRow) -> Tuple[Optional[bytes], str]:
+def _generate_boleto_pdf_if_needed(boleto_data: Dict[str, Any], inv: InvoiceRow, *, include_pix_qrcode: bool) -> Tuple[Optional[bytes], str]:
     if not (boleto_data or {}).get("exists"):
         return None, ""
     attachment_data = boleto_data.get("attachment_data")
     filename = boleto_data.get("filename") or f"boleto_{inv.invoice_id}.pdf"
-    if attachment_data:
+    if attachment_data and include_pix_qrcode:
         return attachment_data, filename
     from ui import build_boleto_pdf_bytes
-    return build_boleto_pdf_bytes(boleto_data, inv), filename
+    return build_boleto_pdf_bytes(boleto_data, inv, include_pix_qrcode=bool(include_pix_qrcode)), filename
 
 
-def _subject(customer_name: str, window_text: str) -> str:
-    return f"Documentos gerados - {customer_name} - {window_text}"
+def _subject(company_name: str, customer_name: str) -> str:
+    customer_name = str(customer_name or "").strip()
+    parts = ["Documentos gerados"]
+    if customer_name:
+        parts.append(customer_name)
+    return " - ".join(parts)
 
 
 class _AutoDocsRunLock:
@@ -154,6 +161,8 @@ def run_auto_documents(
     dry_run: bool,
     user_label: str,
     now: Optional[datetime] = None,
+    force: bool = False,
+    allow_resend: bool = False,
 ) -> Dict[str, Any]:
     system_logger = get_system_logger()
     docs_generated_logger = get_docs_generated_logger()
@@ -171,17 +180,14 @@ def run_auto_documents(
         interval_hours = int(auto_cfg.get("interval_hours") or 4)
     except Exception:
         interval_hours = 4
-    interval_hours = max(1, min(72, interval_hours))
+    max_interval = 720 if force else 72
+    interval_hours = max(1, min(max_interval, interval_hours))
 
-    if not enabled and not dry_run:
+    if not enabled and not (dry_run or force):
         return {"enabled": False, "skipped": True, "reason": "disabled"}
 
-    last_scan_end = _parse_iso_datetime(auto_cfg.get("last_scan_end") or "")
-    if not last_scan_end:
-        last_scan_end = now - timedelta(hours=interval_hours)
-    overlap = timedelta(minutes=5)
-    window_start = last_scan_end - overlap
     window_end = now
+    window_start = now - timedelta(hours=interval_hours)
     window_text = f"{window_start.strftime('%d/%m/%Y %H:%M')} até {window_end.strftime('%d/%m/%Y %H:%M')}"
 
     history = DocumentsHistory()
@@ -210,8 +216,14 @@ def run_auto_documents(
         history.finish_run(run_id, "error", {"error": str(e)})
         raise
 
+    skipped_duplicates = 0
+    kept_sent = 0
     for r in discovered_rows:
-        history.upsert_generated(r)
+        st = history.upsert_generated(r, allow_duplicate=bool(allow_resend))
+        if st == "skipped_duplicate":
+            skipped_duplicates += 1
+        elif st == "kept_sent":
+            kept_sent += 1
         docs_generated_logger.info(
             "gerado boleto_grid=%s movto_id=%s customer_id=%s customer_email=%s documento=%s generated_at=%s",
             str(r.get("boleto_grid") or ""),
@@ -225,8 +237,10 @@ def run_auto_documents(
     smtp_cfg = cfg.get("smtp", {})
     smtp_email = str(smtp_cfg.get("email", "")).strip()
 
+    planned_to_set: set[str] = set()
     emails_sent = 0
     failed_emails = 0
+    sent_to_set: set[str] = set()
     docs_sent = 0
     docs_failed = 0
     docs_no_email = 0
@@ -234,12 +248,11 @@ def run_auto_documents(
     missing_total = 0
 
     extra_body = str(auto_cfg.get("extra_body") or "").strip()
+    include_pix_qrcode = bool(auto_cfg.get("send_pix_qrcode", False))
 
     delay_seconds = int(smtp_cfg.get("delay_seconds", 5))
     first_email = True
     emails_planned = 0
-    pending_snapshot = history.list_pending(limit=5000)
-    pending_before = len(pending_snapshot)
 
     try:
         batch_size = int(auto_cfg.get("pending_batch_size") or 2000)
@@ -247,19 +260,34 @@ def run_auto_documents(
         batch_size = 2000
     batch_size = max(50, min(5000, batch_size))
 
-    try:
-        no_email_retry_hours = int(auto_cfg.get("no_email_retry_hours") or 24)
-    except Exception:
-        no_email_retry_hours = 24
-    no_email_retry_hours = max(1, min(24 * 30, no_email_retry_hours))
+    discovered_grids = [str(r.get("boleto_grid") or "").strip() for r in discovered_rows if str(r.get("boleto_grid") or "").strip()]
+    pending_records = history.list_pending_by_grids(discovered_grids)
+    pending_before = len(pending_records)
+    pending_grids = [p.boleto_grid for p in pending_records if str(p.boleto_grid or "").strip()]
+    if len(pending_grids) > batch_size:
+        pending_grids = pending_grids[:batch_size]
+        pending_records = pending_records[:batch_size]
 
-    retryable = history.list_retryable(limit=batch_size, no_email_retry_hours=no_email_retry_hours)
-    retryable_grids = [p.boleto_grid for p in retryable if p.boleto_grid]
-    if retryable_grids:
+    if dry_run:
+        grouped_keys = set()
+        planned_emails = set()
+        for p in pending_records:
+            to_email = str(p.customer_email or "").strip()
+            if not to_email:
+                continue
+            planned_emails.add(to_email)
+            cid = str(p.customer_id or "").strip()
+            grouped_keys.add(cid if cid not in ("", "0") else to_email)
+        docs_no_email = len([p for p in pending_records if not str(p.customer_email or "").strip()])
+        emails_planned = len(grouped_keys)
+        pending_grids = []
+        planned_to_set = planned_emails
+
+    if pending_grids:
 
         rows_by_grid: Dict[str, Dict[str, Any]] = {}
         try:
-            pending_rows = Database(cfg).list_boletos_by_grids(retryable_grids, include_closed=True)
+            pending_rows = Database(cfg).list_boletos_by_grids(pending_grids, include_closed=True)
             for r in pending_rows:
                 bg = str(r.get("boleto_grid") or "").strip()
                 if bg:
@@ -270,8 +298,7 @@ def run_auto_documents(
         to_process: List[Dict[str, Any]] = []
         closed_grids: List[str] = []
         missing_grids: List[str] = []
-        for p in retryable:
-            bg = str(p.boleto_grid or "").strip()
+        for bg in pending_grids:
             if not bg:
                 continue
             r = rows_by_grid.get(bg)
@@ -309,7 +336,11 @@ def run_auto_documents(
                 continue
             to_email = str(r.get("customer_email") or "").strip()
             cid = r.get("customer_id")
-            key = str(cid) if cid not in (None, "", 0, "0") else (to_email or str(r.get("cliente") or "") or bg)
+            if cid not in (None, "", 0, "0"):
+                key = str(cid)
+            else:
+                cliente = str(r.get("cliente") or "").strip()
+                key = f"{to_email}|{cliente}" if (to_email and cliente) else (to_email or cliente or bg)
             if not to_email:
                 no_email_grids.append(bg)
                 continue
@@ -333,6 +364,7 @@ def run_auto_documents(
             to_email = str(g.get("to_email") or "").strip()
             if not to_email:
                 continue
+            planned_to_set.add(str(to_email))
 
             invoices: List[InvoiceRow] = []
             items: List[Tuple[str, InvoiceRow]] = []
@@ -369,20 +401,23 @@ def run_auto_documents(
             except Exception:
                 signature_map = {}
 
+            nfe_map: Dict[Any, Dict[str, Any]] = {}
+            try:
+                movto_ids = [inv.movto_id for inv in invoices if getattr(inv, "movto_id", None) not in (None, "", 0, "0")]
+                nfe_map = Database(cfg).get_nfe_attachments_bulk(movto_ids)
+            except Exception:
+                nfe_map = {}
+
             for bg, inv in items:
                 boleto_data = payload_map.get(bg) or {}
                 try:
                     if boleto_data.get("exists"):
-                        attachment_data = boleto_data.get("attachment_data")
                         filename = boleto_data.get("filename") or f"boleto_{inv.invoice_id}.pdf"
-                        if attachment_data:
-                            attachments.append((attachment_data, filename, bg))
+                        generated, fname = _generate_boleto_pdf_if_needed(boleto_data, inv, include_pix_qrcode=include_pix_qrcode)
+                        if generated:
+                            attachments.append((generated, fname or filename, bg))
                         else:
-                            generated, fname = _generate_boleto_pdf_if_needed(boleto_data, inv)
-                            if generated:
-                                attachments.append((generated, fname or filename, bg))
-                            else:
-                                missing += 1
+                            missing += 1
                     else:
                         missing += 1
                 except Exception:
@@ -400,6 +435,26 @@ def run_auto_documents(
                 if not sig_added and sig.get("exists") and sig_bytes:
                     attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.movto_id}", ""))
 
+                nfe = nfe_map.get(getattr(inv, "movto_id", None)) or nfe_map.get(str(getattr(inv, "movto_id", None) or "")) or {}
+                nfe_atts = list((nfe.get("attachments") or []))
+                has_pdf = bool([a for a in nfe_atts if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
+                for a in nfe_atts:
+                    if has_pdf:
+                        break
+                    data = a.get("data")
+                    name = str(a.get("filename") or "").lower()
+                    if not data or not name.endswith(".xml"):
+                        continue
+                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(data, fallback_suffix=str(getattr(inv, "invoice_id", "") or getattr(inv, "movto_id", "") or ""))
+                    if pdf_bytes and pdf_name:
+                        nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
+                        has_pdf = True
+                for a in nfe_atts:
+                    data = a.get("data")
+                    name = a.get("filename")
+                    if data and name:
+                        attachments.append((data, name, ""))
+
             attachments_total += len(attachments)
             missing_total += missing
             if dry_run:
@@ -407,7 +462,7 @@ def run_auto_documents(
 
             from ui import build_agenda_email_body
 
-            subject = _subject(invoices[0].customer_name if invoices else "", window_text)
+            subject = _subject(invoices[0].company if invoices else "", invoices[0].customer_name if invoices else "")
 
             purchase_map = {}
             try:
@@ -415,16 +470,6 @@ def run_auto_documents(
                 purchase_map = Database(cfg).get_purchase_info_bulk(movto_ids)
             except Exception:
                 purchase_map = {}
-
-            text_body, html_body = build_agenda_email_body(
-                invoices[0].customer_name if invoices else "",
-                window_text,
-                invoices,
-                missing,
-                extra_body,
-                context_label="Período de geração",
-                purchase_info_map=purchase_map,
-            )
 
             max_attachments = 18
             max_bytes = 15 * 1024 * 1024
@@ -446,9 +491,27 @@ def run_auto_documents(
                 if not first_email and delay_seconds > 0:
                     time.sleep(delay_seconds)
                 first_email = False
+                flags = {"boleto": False, "fatura_pdf": False, "xml": False, "danfe": False, "assinatura": False}
+                try:
+                    from ui import _detect_email_attachment_flags
+
+                    flags = _detect_email_attachment_flags([name for data, name, _bg in batch if data])
+                except Exception:
+                    flags = flags
+
+                text_body, html_body = build_agenda_email_body(
+                    invoices[0].customer_name if invoices else "",
+                    window_text,
+                    invoices,
+                    missing,
+                    extra_body,
+                    context_label="Período de geração",
+                    purchase_info_map=purchase_map,
+                    attachment_flags=flags,
+                )
 
                 msg = EmailMessage()
-                msg["From"] = smtp_email
+                msg["From"] = format_smtp_from(smtp_cfg) or smtp_email
                 msg["To"] = to_email
                 msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
                 msg.set_content(text_body)
@@ -464,6 +527,8 @@ def run_auto_documents(
                 try:
                     _smtp_send_message(cfg, msg)
                     emails_sent += 1
+                    if to_email:
+                        sent_to_set.add(str(to_email))
                     if grids_in_batch:
                         history.mark_sent(grids_in_batch, to_email=to_email)
                         docs_sent += len(grids_in_batch)
@@ -498,6 +563,10 @@ def run_auto_documents(
         "attachments_total": int(attachments_total),
         "missing_total": int(missing_total),
         "run_id": int(run_id),
+        "sent_to": sorted(sent_to_set),
+        "planned_to": sorted(planned_to_set),
+        "skipped_duplicates": int(skipped_duplicates),
+        "already_sent": int(kept_sent),
     }
 
     history.finish_run(run_id, ("dry_run" if dry_run else "ok"), result)

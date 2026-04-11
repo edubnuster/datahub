@@ -8,4 +8,8 @@ dist/
 *.exe
 *.key
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+config.json
+out*.txt
 *.gz

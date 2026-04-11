@@ -2,6 +2,9 @@
 import re
 import calendar
 from datetime import date
+from email.header import Header
+from email.utils import formataddr
+from typing import Any, Dict
 
 class AppError(Exception):
     pass
@@ -35,3 +38,15 @@ def add_months(date_obj: date, months: int) -> date:
     month = total_month % 12 + 1
     day = min(date_obj.day, calendar.monthrange(year, month)[1])
     return date(year, month, day)
+
+def format_smtp_from(smtp_cfg: Dict[str, Any]) -> str:
+    smtp_email = str((smtp_cfg or {}).get("email", "")).strip()
+    if not smtp_email:
+        return ""
+    sender_name = str((smtp_cfg or {}).get("sender_name", "")).strip()
+    if not sender_name:
+        return smtp_email
+    try:
+        return formataddr((str(Header(sender_name, "utf-8")), smtp_email))
+    except Exception:
+        return formataddr((sender_name, smtp_email))

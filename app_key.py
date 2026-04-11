@@ -80,7 +80,21 @@ class KeyGeneratorApp(tk.Tk):
         self.title("Gerador de chave DataHub")
         self.geometry("600x330")
         self.resizable(False, False)
+        self._center_window()
         self._build()
+
+    def _center_window(self, min_x: int = 20, min_y: int = 20):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        width = max(self.winfo_width(), self.winfo_reqwidth())
+        height = max(self.winfo_height(), self.winfo_reqheight())
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = int((screen_w - width) / 2)
+        y = int((screen_h - height) / 2)
+        self.geometry(f"+{max(x, min_x)}+{max(y, min_y)}")
 
     def _build(self):
         wrapper = ttk.Frame(self, padding=18)

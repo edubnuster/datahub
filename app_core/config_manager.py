@@ -26,9 +26,11 @@ class ConfigManager:
 
         merged.setdefault("smtp", {})
         merged["smtp"].setdefault("email", "app@databrev.com.br")
+        merged["smtp"].setdefault("sender_name", "")
         merged["smtp"].setdefault("host", "smtp.zoho.com")
-        merged["smtp"].setdefault("password", "6UBwERuJiqJi")
+        merged["smtp"].setdefault("password", "")
         merged["smtp"].setdefault("port", 465)
+        merged["smtp"].setdefault("delay_seconds", 5)
 
         merged.setdefault("financeiro_agendas", [])
 

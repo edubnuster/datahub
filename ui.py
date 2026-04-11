@@ -17,8 +17,9 @@ from app_core.audit import AuditLogger
 from app_core.auth import UserManager
 from app_core.config_manager import ConfigManager
 from app_core.constants import APP_TITLE, CONFIG_PATH, LICENSE_FILENAME, MASTER_PASSWORD, MASTER_USERNAME
+from app_core.danfe import danfe_pdf_from_nfe_xml
 from app_core.database import Database
-from app_core.helpers import AppError
+from app_core.helpers import AppError, format_smtp_from
 from app_core.license_manager import LicenseManager
 from app_core.models import CustomerRow, InvoiceRow
 
@@ -31,6 +32,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
     if ext == "pdf":
         return "application", "pdf"
+    if ext == "xml":
+        return "application", "xml"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -38,6 +41,89 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
     if ext in ("tif", "tiff"):
         return "image", "tiff"
     return "application", "octet-stream"
+
+
+def _detect_email_attachment_flags(filenames: List[str]) -> Dict[str, bool]:
+    names = [str(n or "").strip().lower() for n in (filenames or []) if str(n or "").strip()]
+    has_xml = any(n.endswith(".xml") and ("nfe" in n or "xml" in n) for n in names)
+    has_danfe = any(n.endswith(".pdf") and "danfe" in n for n in names)
+    has_boleto = any(n.endswith(".pdf") and "boleto" in n and "danfe" not in n for n in names)
+    has_signature = any(("assinatura" in n or "cupom" in n) and (n.endswith(".pdf") or n.endswith(".png") or n.endswith(".jpg") or n.endswith(".jpeg")) for n in names)
+    has_invoice_pdf = any(n.endswith(".pdf") and ("fatura" in n or "invoice" in n) for n in names)
+    return {"boleto": has_boleto, "fatura_pdf": has_invoice_pdf, "xml": has_xml, "danfe": has_danfe, "assinatura": has_signature}
+
+
+def _format_attachment_status(value: bool, reason: str = "") -> str:
+    if value:
+        return "Sim"
+    r = str(reason or "").strip()
+    if r:
+        return f"Não ({r})"
+    return "Não"
+
+
+def build_attachments_note_text(
+    *,
+    has_boleto: bool,
+    has_fatura_pdf: bool,
+    has_xml: bool,
+    has_danfe: bool,
+    has_assinatura: bool,
+    boleto_reason: str = "",
+    fatura_reason: str = "a fatura está no corpo do e-mail",
+    xml_reason: str = "",
+    danfe_reason: str = "",
+    assinatura_reason: str = "",
+    missing_boleto_count: int = 0,
+) -> str:
+    boleto_status = _format_attachment_status(has_boleto, boleto_reason)
+    if missing_boleto_count and has_boleto:
+        boleto_status = f"Parcial ({missing_boleto_count} não anexado(s))"
+    elif missing_boleto_count and not has_boleto:
+        boleto_status = f"Não ({missing_boleto_count} não anexado(s))"
+    return (
+        "Observação: Anexos deste e-mail:\n"
+        f"- Boleto: {boleto_status}\n"
+        f"- Fatura (PDF): {_format_attachment_status(has_fatura_pdf, fatura_reason)}\n"
+        f"- XML da NF-e: {_format_attachment_status(has_xml, xml_reason)}\n"
+        f"- DANFE: {_format_attachment_status(has_danfe, danfe_reason)}\n"
+        f"- Cupom assinado: {_format_attachment_status(has_assinatura, assinatura_reason)}"
+    )
+
+
+def build_attachments_note_html(
+    *,
+    has_boleto: bool,
+    has_fatura_pdf: bool,
+    has_xml: bool,
+    has_danfe: bool,
+    has_assinatura: bool,
+    boleto_reason: str = "",
+    fatura_reason: str = "a fatura está no corpo do e-mail",
+    xml_reason: str = "",
+    danfe_reason: str = "",
+    assinatura_reason: str = "",
+    missing_boleto_count: int = 0,
+) -> str:
+    boleto_status = _format_attachment_status(has_boleto, boleto_reason)
+    if missing_boleto_count and has_boleto:
+        boleto_status = f"Parcial ({missing_boleto_count} não anexado(s))"
+    elif missing_boleto_count and not has_boleto:
+        boleto_status = f"Não ({missing_boleto_count} não anexado(s))"
+    items = [
+        ("Boleto", boleto_status),
+        ("Fatura (PDF)", _format_attachment_status(has_fatura_pdf, fatura_reason)),
+        ("XML da NF-e", _format_attachment_status(has_xml, xml_reason)),
+        ("DANFE", _format_attachment_status(has_danfe, danfe_reason)),
+        ("Cupom assinado", _format_attachment_status(has_assinatura, assinatura_reason)),
+    ]
+    li = "".join([f"<li><b>{html.escape(k)}:</b> {html.escape(v)}</li>" for k, v in items])
+    return (
+        "<div style='margin:12px 0;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;color:#9a3412;'>"
+        "<b>Observação:</b> Anexos deste e-mail:"
+        f"<ul style='margin:8px 0 0 18px;padding:0;'>{li}</ul>"
+        "</div>"
+    )
 
 
 def format_date_br(value: date) -> str:
@@ -118,6 +204,88 @@ def bind_date_entry_shortcuts(entry):
 
     entry.bind("<KeyPress>", _handle_keypress, add="+")
     entry.bind("<KeyRelease>", _format_typed_date, add="+")
+
+
+def _parse_flexible_time_hhmm(value: str) -> Optional[time]:
+    raw = str(value or "").strip().lower().replace(" ", "")
+    if not raw:
+        return None
+    raw = raw.replace("h", ":")
+    if raw.endswith(":"):
+        raw = raw + "00"
+    if ":" not in raw:
+        raw = raw + ":00"
+    parts = raw.split(":")
+    if len(parts) >= 2:
+        raw = f"{parts[0]}:{parts[1]}"
+    try:
+        return datetime.strptime(raw, "%H:%M").time()
+    except Exception:
+        return None
+
+
+def bind_time_entry_shortcuts(entry):
+    def _set_entry_text(value: str):
+        entry.delete(0, "end")
+        entry.insert(0, value)
+        entry.icursor("end")
+
+    def _apply_shortcut(action: str):
+        if action == "now":
+            new_dt = datetime.now().replace(second=0, microsecond=0)
+        else:
+            current_t = _parse_flexible_time_hhmm(entry.get())
+            if current_t is None:
+                new_dt = datetime.now().replace(second=0, microsecond=0)
+            else:
+                new_dt = datetime.combine(date.today(), current_t)
+            new_dt = new_dt + timedelta(minutes=(-1 if action == "minus" else 1))
+        _set_entry_text(new_dt.strftime("%H:%M"))
+
+    def _format_typed_time(event=None):
+        keysym = getattr(event, "keysym", "")
+        if keysym in (
+            "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+            "Left", "Right", "Up", "Down", "Home", "End", "Tab", "Return",
+            "Escape"
+        ):
+            return None
+
+        digits = re.sub(r"\D", "", entry.get())[:4]
+        if not digits:
+            if entry.get():
+                _set_entry_text("")
+            return None
+
+        if len(digits) <= 2:
+            formatted = digits
+        else:
+            formatted = f"{digits[:2]}:{digits[2:]}"
+
+        if entry.get() != formatted:
+            _set_entry_text(formatted)
+        return None
+
+    def _handle_keypress(event=None):
+        keysym = getattr(event, "keysym", "")
+        char = getattr(event, "char", "")
+
+        if keysym in ("equal", "KP_Equal") or char == "=":
+            _apply_shortcut("now")
+            return "break"
+
+        if keysym in ("minus", "KP_Subtract") or char == "-":
+            _apply_shortcut("minus")
+            return "break"
+
+        if keysym in ("plus", "KP_Add") or char == "+":
+            _apply_shortcut("plus")
+            return "break"
+
+        return None
+
+    entry.bind("<KeyPress>", _handle_keypress, add="+")
+    entry.bind("<KeyRelease>", _format_typed_time, add="+")
 
 
 def money_br(value: Any) -> str:
@@ -324,7 +492,15 @@ def build_purchase_info_blocks(invoice_row: InvoiceRow, purchase_info_map: Optio
     return "\n" + text_block + "\n", html_block
 
 
-def build_due_alert_email_body(customer_name: str, base_date: date, invoices: List["InvoiceRow"], missing_count: int, extra_body: str, purchase_info_map: Optional[Dict[Any, Dict[str, Any]]] = None) -> tuple[str, str]:
+def build_due_alert_email_body(
+    customer_name: str,
+    base_date: date,
+    invoices: List["InvoiceRow"],
+    missing_count: int,
+    extra_body: str,
+    purchase_info_map: Optional[Dict[Any, Dict[str, Any]]] = None,
+    attachment_flags: Optional[Dict[str, bool]] = None,
+) -> tuple[str, str]:
     def _status_text(vencto: Any) -> str:
         if not isinstance(vencto, date):
             return ""
@@ -350,8 +526,6 @@ def build_due_alert_email_body(customer_name: str, base_date: date, invoices: Li
             f"<td>{html.escape(str(inv.invoice_id))}</td>"
             f"<td>{html.escape(inv.issue_date_display())}</td>"
             f"<td>{html.escape(inv.due_date_display())}</td>"
-            f"<td>{html.escape(inv.amount_display())}</td>"
-            f"<td>{html.escape(inv.discount_amount_display())}</td>"
             f"<td>{html.escape(inv.open_balance_display())}</td>"
             f"<td>{html.escape(status)}</td>"
             "</tr>"
@@ -359,7 +533,24 @@ def build_due_alert_email_body(customer_name: str, base_date: date, invoices: Li
 
     note = ""
     note_html = ""
-    if missing_count:
+    if attachment_flags is not None:
+        note = "\n" + build_attachments_note_text(
+            has_boleto=bool(attachment_flags.get("boleto")),
+            has_fatura_pdf=bool(attachment_flags.get("fatura_pdf")),
+            has_xml=bool(attachment_flags.get("xml")),
+            has_danfe=bool(attachment_flags.get("danfe")),
+            has_assinatura=bool(attachment_flags.get("assinatura")),
+            missing_boleto_count=int(missing_count or 0),
+        ) + "\n"
+        note_html = build_attachments_note_html(
+            has_boleto=bool(attachment_flags.get("boleto")),
+            has_fatura_pdf=bool(attachment_flags.get("fatura_pdf")),
+            has_xml=bool(attachment_flags.get("xml")),
+            has_danfe=bool(attachment_flags.get("danfe")),
+            has_assinatura=bool(attachment_flags.get("assinatura")),
+            missing_boleto_count=int(missing_count or 0),
+        )
+    elif missing_count:
         note = f"\nObservação: {missing_count} boleto(s) não puderam ser anexados automaticamente.\n"
         note_html = f"<div style='margin:12px 0;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;color:#9a3412;'><b>Observação:</b> {missing_count} boleto(s) não puderam ser anexados automaticamente.</div>"
 
@@ -423,9 +614,7 @@ def build_due_alert_email_body(customer_name: str, base_date: date, invoices: Li
           <th>Documento / Fatura</th>
           <th>Emissão</th>
           <th>Vencimento</th>
-          <th>Valor Original</th>
-          <th>Desconto</th>
-          <th>Saldo</th>
+          <th>Valor da fatura</th>
           <th>Situação</th>
         </tr>
       </thead>
@@ -452,6 +641,7 @@ def build_agenda_email_body(
     extra_body: str,
     context_label: str = "Vencimento",
     purchase_info_map: Optional[Dict[Any, Dict[str, Any]]] = None,
+    attachment_flags: Optional[Dict[str, bool]] = None,
 ) -> tuple[str, str]:
     total = 0.0
     lines = []
@@ -462,22 +652,37 @@ def build_agenda_email_body(
         except Exception:
             pass
         lines.append(
-            f"- Fatura {inv.invoice_id} | Emissão: {inv.issue_date_display()} | Venc.: {inv.due_date_display()} | Saldo: {inv.open_balance_display()}"
+            f"- Fatura {inv.invoice_id} | Emissão: {inv.issue_date_display()} | Venc.: {inv.due_date_display()} | Total fatura: {inv.open_balance_display()}"
         )
         html_rows.append(
             "<tr>"
             f"<td>{html.escape(str(inv.invoice_id))}</td>"
             f"<td>{html.escape(inv.issue_date_display())}</td>"
             f"<td>{html.escape(inv.due_date_display())}</td>"
-            f"<td>{html.escape(inv.amount_display())}</td>"
-            f"<td>{html.escape(inv.discount_amount_display())}</td>"
             f"<td>{html.escape(inv.open_balance_display())}</td>"
             "</tr>"
         )
 
     note = ""
     note_html = ""
-    if missing_count:
+    if attachment_flags is not None:
+        note = "\n" + build_attachments_note_text(
+            has_boleto=bool(attachment_flags.get("boleto")),
+            has_fatura_pdf=bool(attachment_flags.get("fatura_pdf")),
+            has_xml=bool(attachment_flags.get("xml")),
+            has_danfe=bool(attachment_flags.get("danfe")),
+            has_assinatura=bool(attachment_flags.get("assinatura")),
+            missing_boleto_count=int(missing_count or 0),
+        ) + "\n"
+        note_html = build_attachments_note_html(
+            has_boleto=bool(attachment_flags.get("boleto")),
+            has_fatura_pdf=bool(attachment_flags.get("fatura_pdf")),
+            has_xml=bool(attachment_flags.get("xml")),
+            has_danfe=bool(attachment_flags.get("danfe")),
+            has_assinatura=bool(attachment_flags.get("assinatura")),
+            missing_boleto_count=int(missing_count or 0),
+        )
+    elif missing_count:
         note = f"\nObservação: {missing_count} boleto(s) não puderam ser anexados automaticamente.\n"
         note_html = f"<div style='margin:12px 0;padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;color:#9a3412;'><b>Observação:</b> {missing_count} boleto(s) não puderam ser anexados automaticamente.</div>"
 
@@ -540,9 +745,7 @@ def build_agenda_email_body(
           <th>Documento / Fatura</th>
           <th>Emissão</th>
           <th>Vencimento</th>
-          <th>Valor Original</th>
-          <th>Desconto</th>
-          <th>Saldo</th>
+          <th>Total fatura</th>
         </tr>
       </thead>
       <tbody>
@@ -699,6 +902,12 @@ def run_with_busy(
     on_success,
     on_error=None,
 ):
+    if threading.current_thread() is not threading.main_thread():
+        try:
+            window.after(0, lambda: run_with_busy(window, message, work, on_success, on_error))
+        except Exception:
+            pass
+        return None
     overlay = _ensure_busy_overlay(window)
     overlay.show(message)
     cancelled = {"value": False}
@@ -732,7 +941,9 @@ def run_with_busy(
         except Exception:
             cancelled["value"] = True
 
-    threading.Thread(target=_run, daemon=True).start()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
 
 
 def _pdf_escape(text: str) -> str:
@@ -1171,6 +1382,7 @@ class ConfigWindow(SimpleDialog):
         smtp_cfg = self.config_data.get("smtp", {})
         smtp_fields = [
             ("E-mail remetente", "smtp_email"),
+            ("Nome do remetente", "smtp_sender_name"),
             ("Servidor SMTP", "smtp_host"),
             ("Senha", "smtp_password"),
             ("Porta", "smtp_port"),
@@ -1223,6 +1435,7 @@ class ConfigWindow(SimpleDialog):
 
         cfg["smtp"] = {
             "email": self.entries["smtp_email"].get().strip(),
+            "sender_name": self.entries.get("smtp_sender_name").get().strip() if self.entries.get("smtp_sender_name") else "",
             "host": self.entries["smtp_host"].get().strip(),
             "password": self.entries["smtp_password"].get().strip(),
             "port": smtp_port,
@@ -1273,12 +1486,13 @@ class EmailComposeWindow(SimpleDialog):
         self.current_user = current_user
         self.invoice_row = invoice_row
         self.customer_email = customer_email or ""
-        self.boleto_data: Dict[str, Any] = {"exists": False, "email_note": "Observação: consultando dados do boleto."}
+        self.boleto_data: Dict[str, Any] = {"exists": False, "email_note": "Observação: consultando documentos."}
+        self.nfe_data: Dict[str, Any] = {"exists": False, "attachments": []}
         self.purchase_map: Dict[Any, Dict[str, Any]] = {}
         self.purchase_error: str = ""
         self.attachment_bytes = None
         self.attachment_name = ""
-        self.boleto_status_text = "Consultando boleto..."
+        self.boleto_status_text = "Consultando documentos..."
         self.boleto_status_var = tk.StringVar(value=f"Status do boleto: {self.boleto_status_text}")
         self.send_pix_qrcode_var = tk.BooleanVar(value=False)
         super().__init__(master, "Enviar fatura por e-mail", "760x680")
@@ -1298,12 +1512,31 @@ class EmailComposeWindow(SimpleDialog):
                 purchase_error = str(e) or "Falha ao consultar itens da venda."
                 if len(purchase_error) > 220:
                     purchase_error = purchase_error[:220] + "..."
-            return payload, purchase_map, purchase_error
+            try:
+                nfe_map = db.get_nfe_attachments_bulk([inv_key])
+            except Exception:
+                nfe_map = {}
+            return payload, purchase_map, purchase_error, nfe_map, inv_key
 
         def _ok(result):
-            payload, purchase_map, purchase_error = result
+            payload, purchase_map, purchase_error, nfe_map, inv_key = result
             self.purchase_map = purchase_map or {}
             self.purchase_error = "" if self.purchase_map else str(purchase_error or "").strip()
+            self.nfe_data = (nfe_map or {}).get(inv_key) or (nfe_map or {}).get(str(inv_key)) or {"exists": False, "attachments": []}
+            nfe_atts = list((self.nfe_data or {}).get("attachments") or [])
+            has_pdf = bool([a for a in nfe_atts if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
+            for a in nfe_atts:
+                if has_pdf:
+                    break
+                name = str(a.get("filename") or "").lower()
+                data = a.get("data")
+                if not data or not name.endswith(".xml"):
+                    continue
+                pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(data, fallback_suffix=str(inv_key))
+                if pdf_bytes and pdf_name:
+                    nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
+                    has_pdf = True
+            self.nfe_data["attachments"] = nfe_atts
             self._apply_boleto_payload(payload)
             self._maybe_refresh_default_body()
             try:
@@ -1327,7 +1560,7 @@ class EmailComposeWindow(SimpleDialog):
             self.send_btn.state(["disabled"])
         except Exception:
             pass
-        run_with_busy(self, "Consultando dados do boleto...", _work, _ok, _err)
+        run_with_busy(self, "Consultando documentos...", _work, _ok, _err)
 
     def _apply_boleto_payload(self, payload: Dict[str, Any]):
         self.boleto_data = payload or {}
@@ -1362,15 +1595,31 @@ class EmailComposeWindow(SimpleDialog):
     def _default_body(self) -> str:
         company = str(self.invoice_row.company or "").strip()
         account_display = (f"{self.invoice_row.account_code or ''} - {self.invoice_row.account_name or ''}").strip(" -")
-        note = str(self.boleto_data.get("email_note", "") or "").strip()
-        if not note:
-            if self.boleto_data.get("exists"):
-                if getattr(self, "attachment_bytes", None):
-                    note = "Observação: o boleto foi localizado e segue em anexo (PDF)."
-                else:
-                    note = "Observação: o boleto foi localizado e será gerado em PDF pelo app para envio em anexo."
-            else:
-                note = "Observação: o boleto ainda não foi gerado."
+        note = ""
+        
+        try:
+            sig = Database(self.config_data).get_sale_signature_pdf(getattr(self.invoice_row, "invoice_id", None))
+        except Exception:
+            sig = {}
+        has_signature = (sig or {}).get("exists") or bool((sig or {}).get("attachments"))
+        has_nfe_xml = bool([a for a in ((self.nfe_data or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".xml") and a.get("data")])
+        has_danfe = bool([a for a in ((self.nfe_data or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
+        has_boleto = bool(self.boleto_data.get("exists"))
+        boleto_reason = "" if has_boleto else "ainda não gerado"
+        xml_reason = "" if has_nfe_xml else "não encontrado"
+        danfe_reason = "não gerada" if (has_nfe_xml and not has_danfe) else ""
+        assinatura_reason = "" if has_signature else "não encontrado"
+        note = build_attachments_note_text(
+            has_boleto=has_boleto,
+            has_fatura_pdf=False,
+            has_xml=has_nfe_xml,
+            has_danfe=has_danfe,
+            has_assinatura=has_signature,
+            boleto_reason=boleto_reason,
+            xml_reason=xml_reason,
+            danfe_reason=danfe_reason,
+            assinatura_reason=assinatura_reason,
+        )
                 
         invoice_id = str(getattr(self.invoice_row, "invoice_id", "") or "").strip()
         doc_str = invoice_id if invoice_id else "N/A"
@@ -1396,30 +1645,35 @@ class EmailComposeWindow(SimpleDialog):
     def _default_body_html(self) -> str:
         company = str(self.invoice_row.company or "").strip()
         account_display = (f"{self.invoice_row.account_code or ''} - {self.invoice_row.account_name or ''}").strip(" -")
-        note = str(self.boleto_data.get("email_note", "") or "").strip()
+        note = ""
+        
+        try:
+            sig = Database(self.config_data).get_sale_signature_pdf(getattr(self.invoice_row, "invoice_id", None))
+        except Exception:
+            sig = {}
+        has_signature = (sig or {}).get("exists") or bool((sig or {}).get("attachments"))
+        has_nfe_xml = bool([a for a in ((self.nfe_data or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".xml") and a.get("data")])
+        has_danfe = bool([a for a in ((self.nfe_data or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
         
         note_bg = "#fff7ed"
         note_border = "#fed7aa"
         note_color = "#9a3412"
-        
-        if not note:
-            if self.boleto_data.get("exists"):
-                if getattr(self, "attachment_bytes", None):
-                    note = "<b>Observação:</b> o boleto foi localizado e segue em anexo (PDF)."
-                    note_bg = "#ecfdf5"
-                    note_border = "#a7f3d0"
-                    note_color = "#065f46"
-                else:
-                    note = "<b>Observação:</b> o boleto foi localizado e será gerado em PDF pelo app para envio em anexo."
-                    note_bg = "#ecfdf5"
-                    note_border = "#a7f3d0"
-                    note_color = "#065f46"
-            else:
-                note = "<b>Observação:</b> o boleto ainda não foi gerado."
-        else:
-            note = html.escape(note)
-            
-        html_note = f"<div class='note'>{note}</div>"
+        has_boleto = bool(self.boleto_data.get("exists"))
+        boleto_reason = "" if has_boleto else "ainda não gerado"
+        xml_reason = "" if has_nfe_xml else "não encontrado"
+        danfe_reason = "não gerada" if (has_nfe_xml and not has_danfe) else ""
+        assinatura_reason = "" if has_signature else "não encontrado"
+        html_note = build_attachments_note_html(
+            has_boleto=has_boleto,
+            has_fatura_pdf=False,
+            has_xml=has_nfe_xml,
+            has_danfe=has_danfe,
+            has_assinatura=has_signature,
+            boleto_reason=boleto_reason,
+            xml_reason=xml_reason,
+            danfe_reason=danfe_reason,
+            assinatura_reason=assinatura_reason,
+        )
         _, purchase_html = build_purchase_info_blocks(self.invoice_row, self.purchase_map)
         purchase_err = str(getattr(self, "purchase_error", "") or "").strip()
         if purchase_err and not purchase_html:
@@ -1452,9 +1706,7 @@ class EmailComposeWindow(SimpleDialog):
           <th>Documento / Fatura</th>
           <th>Emissão</th>
           <th>Vencimento</th>
-          <th>Valor Original</th>
-          <th>Desconto</th>
-          <th>Saldo a Pagar</th>
+          <th>Valor da fatura</th>
         </tr>
       </thead>
       <tbody>
@@ -1462,8 +1714,6 @@ class EmailComposeWindow(SimpleDialog):
           <td>{html.escape(doc_str)}</td>
           <td>{html.escape(self.invoice_row.issue_date_display())}</td>
           <td>{html.escape(self.invoice_row.due_date_display())}</td>
-          <td>{html.escape(self.invoice_row.amount_display())}</td>
-          <td>{html.escape(self.invoice_row.discount_amount_display())}</td>
           <td>{html.escape(self.invoice_row.open_balance_display())}</td>
         </tr>
       </tbody>
@@ -1535,7 +1785,7 @@ class EmailComposeWindow(SimpleDialog):
             return
 
         msg = EmailMessage()
-        msg["From"] = smtp_email
+        msg["From"] = format_smtp_from(smtp_cfg) or smtp_email
         msg["To"] = to_email
         msg["Subject"] = subject
         msg.set_content(body)
@@ -1608,6 +1858,15 @@ class EmailComposeWindow(SimpleDialog):
             name = (sig or {}).get("filename") or f"assinatura_{getattr(self.invoice_row, 'invoice_id', None) or ''}"
             maintype, subtype = _mime_parts_from_filename(name)
             msg.add_attachment(sig_bytes, maintype=maintype, subtype=subtype, filename=name)
+
+        nfe = self.nfe_data or {}
+        for a in (nfe.get("attachments") or []):
+            data = a.get("data")
+            name = a.get("filename")
+            if not data or not name:
+                continue
+            maintype, subtype = _mime_parts_from_filename(name)
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
 
         try:
             if smtp_port == 465:
@@ -1851,6 +2110,8 @@ class InactiveCustomersWindow(tk.Toplevel):
         self.filtered_rows: List[CustomerRow] = []
         self.tree_items: Dict[str, CustomerRow] = {}
         self.filter_var = tk.StringVar(value="Todos")
+        self.inactive_amount_var = tk.StringVar(value="2")
+        self.inactive_unit_var = tk.StringVar(value="Anos")
         self.sort_column: Optional[str] = None
         self.sort_reverse = False
         self.status_var = tk.StringVar(value="Pronto.")
@@ -1889,12 +2150,14 @@ class InactiveCustomersWindow(tk.Toplevel):
         ttk.Button(left_actions, text="Atualizar lista", command=self.load_data).pack(side="left")
         ttk.Button(left_actions, text="Marcar todos", command=self.mark_all).pack(side="left", padx=(8, 0))
         ttk.Button(left_actions, text="Desmarcar todos", command=self.unmark_all).pack(side="left", padx=(8, 0))
-        ttk.Button(left_actions, text="Voltar ao início", command=self._close).pack(side="left", padx=(16, 0))
+        
+        ttk.Button(row1, text="Voltar ao início", command=self._close).pack(side="right")
+        
         actions = ttk.Frame(row1)
-        actions.pack(side="right")
+        actions.pack(side="right", padx=(0, 16))
         ttk.Button(actions, text="Inativar cliente", command=lambda: self.run_action("inactivate_customer_sql", "Inativar cliente", "Inativo")).pack(side="left")
         ttk.Button(actions, text="Excluir cliente", command=lambda: self.run_action("delete_customer_sql", "Excluir cliente", "Deletado")).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Inativar vendas a prazo", command=lambda: self.run_action("disable_credit_sql", "Inativar vendas a prazo", None)).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Zerar limite", command=lambda: self.run_action("disable_credit_sql", "Zerar limite", None)).pack(side="left", padx=(8, 0))
         row2 = ttk.Frame(top)
         row2.pack(fill="x", pady=(8, 0))
         filter_box = ttk.Frame(row2)
@@ -1903,6 +2166,16 @@ class InactiveCustomersWindow(tk.Toplevel):
         filtro = ttk.Combobox(filter_box, textvariable=self.filter_var, values=list(self.FILTER_OPTIONS.keys()), state="readonly", width=12)
         filtro.pack(side="left")
         filtro.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
+
+        ttk.Separator(filter_box, orient="vertical").pack(side="left", padx=12, fill="y")
+        ttk.Label(filter_box, text="Tempo inativo:").pack(side="left", padx=(0, 6))
+        tempo_spin = ttk.Spinbox(filter_box, from_=1, to=240, textvariable=self.inactive_amount_var, width=6)
+        tempo_spin.pack(side="left")
+        tempo_spin.bind("<Return>", lambda e: self.load_data())
+        tempo_spin.bind("<FocusOut>", lambda e: self._sync_inactive_amount())
+        tempo_unidade = ttk.Combobox(filter_box, textvariable=self.inactive_unit_var, values=["Meses", "Anos"], state="readonly", width=7)
+        tempo_unidade.pack(side="left", padx=(6, 0))
+        tempo_unidade.bind("<<ComboboxSelected>>", lambda e: self.load_data())
         middle = ttk.Frame(self, padding=(12, 0, 12, 0))
         middle.pack(fill="both", expand=True)
         columns = ("company", "code", "name", "account", "credit_limit", "last_date", "status")
@@ -1935,6 +2208,23 @@ class InactiveCustomersWindow(tk.Toplevel):
         bottom.pack(fill="x")
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
         ttk.Label(bottom, text=f"Usuário: {self.current_user}").pack(side="right")
+    def _sync_inactive_amount(self):
+        try:
+            value = int(self.inactive_amount_var.get() or 0)
+        except Exception:
+            value = 0
+        if value < 1:
+            self.inactive_amount_var.set(1)
+    def _inactive_months(self) -> int:
+        self._sync_inactive_amount()
+        try:
+            value = int(self.inactive_amount_var.get() or 1)
+        except Exception:
+            value = 1
+        unit = (self.inactive_unit_var.get() or "Meses").strip()
+        if unit.lower().startswith("ano"):
+            return max(1, value) * 12
+        return max(1, value)
     def _close(self):
         self.destroy()
         if hasattr(self.master_app, "inactive_window"):
@@ -2017,7 +2307,7 @@ class InactiveCustomersWindow(tk.Toplevel):
         self.set_status("Conectando ao banco e carregando clientes.")
 
         def _work():
-            return Database(self.config_data).list_inactive_customers()
+            return Database(self.config_data).list_inactive_customers(inactive_months=self._inactive_months())
 
         def _ok(data):
             self.rows = [
@@ -2149,8 +2439,8 @@ class OpenInvoicesWindow(tk.Toplevel):
         self.sort_reverse = False
         self.status_var = tk.StringVar(value="Pronto.")
         today = date.today()
-        self.period_start_var = tk.StringVar(value=(today - timedelta(days=30)).strftime("%d/%m/%Y"))
-        self.period_end_var = tk.StringVar(value=(today + timedelta(days=180)).strftime("%d/%m/%Y"))
+        self.period_start_var = tk.StringVar(value=today.strftime("%d/%m/%Y"))
+        self.period_end_var = tk.StringVar(value=today.strftime("%d/%m/%Y"))
         self.group_by_var = tk.StringVar(value="Não agrupar")
         self.customer_var = tk.StringVar(value="Todos")
         self.account_var = tk.StringVar(value="Todas")
@@ -2184,6 +2474,25 @@ class OpenInvoicesWindow(tk.Toplevel):
             customers = db.list_open_invoice_customers()
             accounts = db.list_open_invoice_accounts()
             invoices = db.list_open_invoices(due_date_from=date_from, due_date_to=date_to, customer_id=None, account_code=None)
+            invoice_ids = [r.get("movto_id") for r in (invoices or [])]
+            try:
+                sig_map = db.get_sale_signatures_pdf_bulk(invoice_ids)
+            except Exception:
+                sig_map = {}
+            try:
+                boleto_map = db.check_boleto_exists_bulk(invoice_ids)
+            except Exception:
+                boleto_map = {}
+            try:
+                nf_map = db.check_nota_fiscal_exists_bulk(invoice_ids)
+            except Exception:
+                nf_map = {}
+            for r in (invoices or []):
+                inv_id = r.get("movto_id")
+                sig = sig_map.get(inv_id) or sig_map.get(str(inv_id)) or {}
+                r["has_signed_doc"] = bool(sig.get("exists") or (sig.get("attachments") or []))
+                r["has_boleto"] = bool(boleto_map.get(inv_id) or boleto_map.get(str(inv_id)))
+                r["has_nota_fiscal"] = bool(nf_map.get(inv_id) or nf_map.get(str(inv_id)))
             return customers, accounts, invoices
 
         def _ok(res):
@@ -2223,6 +2532,9 @@ class OpenInvoicesWindow(tk.Toplevel):
                 customer_id=row.get("customer_id"),
                 customer_code=row.get("codigo_cliente"),
                 customer_name=row.get("cliente") or "",
+                has_signed_doc=bool(row.get("has_signed_doc")),
+                has_boleto=bool(row.get("has_boleto")),
+                has_nota_fiscal=bool(row.get("has_nota_fiscal")),
                 motive_code=row.get("motivo"),
                 motive_name=f"Motivo {row.get('motivo')}" if row.get("motivo") not in (None, "") else "",
                 account_code=row.get("conta") or "",
@@ -2268,7 +2580,9 @@ class OpenInvoicesWindow(tk.Toplevel):
         actions.pack(side="left")
         ttk.Button(actions, text="Limpar filtros", command=self.clear_filters).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Enviar fatura por e-mail", command=self.open_email_window).pack(side="left", padx=(12, 0))
-        ttk.Button(actions, text="Voltar ao início", command=self._close).pack(side="left", padx=(12, 0))
+        
+        ttk.Button(top, text="Voltar ao início", command=self._close).pack(side="right")
+        
         filters = ttk.Frame(self, padding=(12, 0, 12, 8))
         filters.pack(fill="x")
         ttk.Label(filters, text="Vencimento inicial").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
@@ -2328,7 +2642,7 @@ class OpenInvoicesWindow(tk.Toplevel):
         filters.columnconfigure(7, weight=1)
         middle = ttk.Frame(self, padding=(12, 0, 12, 0))
         middle.pack(fill="both", expand=True)
-        columns = ("company", "account_display", "code", "name", "issue_date", "due_date", "amount", "discount", "open_balance")
+        columns = ("company", "account_display", "code", "name", "issue_date", "due_date", "open_balance", "signed_doc", "boleto", "nota_fiscal")
         self.tree = ttk.Treeview(middle, columns=columns, show="headings", selectmode="browse")
         self.tree.heading("company", text="Empresa", command=lambda: self.sort_by("company"))
         self.tree.heading("account_display", text="Conta", command=lambda: self.sort_by("account_display"))
@@ -2336,18 +2650,20 @@ class OpenInvoicesWindow(tk.Toplevel):
         self.tree.heading("name", text="Cliente", command=lambda: self.sort_by("name"))
         self.tree.heading("issue_date", text="Data", command=lambda: self.sort_by("issue_date"))
         self.tree.heading("due_date", text="Vencimento", command=lambda: self.sort_by("due_date"))
-        self.tree.heading("amount", text="Valor", command=lambda: self.sort_by("amount"))
-        self.tree.heading("discount", text="Desconto", command=lambda: self.sort_by("discount"))
-        self.tree.heading("open_balance", text="Saldo em aberto", command=lambda: self.sort_by("open_balance"))
+        self.tree.heading("open_balance", text="Valor da fatura", command=lambda: self.sort_by("open_balance"))
+        self.tree.heading("signed_doc", text="Assinado", command=lambda: self.sort_by("signed_doc"))
+        self.tree.heading("boleto", text="Boleto", command=lambda: self.sort_by("boleto"))
+        self.tree.heading("nota_fiscal", text="NF", command=lambda: self.sort_by("nota_fiscal"))
         self.tree.column("company", width=180, minwidth=160, anchor="w", stretch=False)
         self.tree.column("account_display", width=260, minwidth=240, anchor="w", stretch=False)
         self.tree.column("code", width=80, minwidth=70, anchor="center", stretch=False)
         self.tree.column("name", width=250, minwidth=220, anchor="w", stretch=True)
         self.tree.column("issue_date", width=100, minwidth=90, anchor="center", stretch=False)
         self.tree.column("due_date", width=100, minwidth=90, anchor="center", stretch=False)
-        self.tree.column("amount", width=110, minwidth=100, anchor="e", stretch=False)
-        self.tree.column("discount", width=110, minwidth=100, anchor="e", stretch=False)
         self.tree.column("open_balance", width=130, minwidth=120, anchor="e", stretch=False)
+        self.tree.column("signed_doc", width=90, minwidth=80, anchor="center", stretch=False)
+        self.tree.column("boleto", width=80, minwidth=70, anchor="center", stretch=False)
+        self.tree.column("nota_fiscal", width=70, minwidth=60, anchor="center", stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll = ttk.Scrollbar(middle, orient="vertical", command=self.tree.yview)
         yscroll.grid(row=0, column=1, sticky="ns")
@@ -2422,8 +2738,8 @@ class OpenInvoicesWindow(tk.Toplevel):
 
     def clear_filters(self):
         today = date.today()
-        self.period_start_var.set((today - timedelta(days=30)).strftime("%d/%m/%Y"))
-        self.period_end_var.set((today + timedelta(days=180)).strftime("%d/%m/%Y"))
+        self.period_start_var.set(today.strftime("%d/%m/%Y"))
+        self.period_end_var.set(today.strftime("%d/%m/%Y"))
         self.customer_var.set("Todos")
         self.account_var.set("Todas")
         self.group_by_var.set("Não agrupar")
@@ -2799,12 +3115,14 @@ class OpenInvoicesWindow(tk.Toplevel):
             return row.issue_date or datetime.min
         if column == "due_date":
             return row.due_date or datetime.min
-        if column == "amount":
-            return float(row.amount or 0)
-        if column == "discount":
-            return float(row.discount_amount or 0)
         if column == "open_balance":
             return float(row.open_balance or 0)
+        if column == "signed_doc":
+            return 1 if getattr(row, "has_signed_doc", False) else 0
+        if column == "boleto":
+            return 1 if getattr(row, "has_boleto", False) else 0
+        if column == "nota_fiscal":
+            return 1 if getattr(row, "has_nota_fiscal", False) else 0
         return ""
     def sort_by(self, column: str):
         if self.sort_column == column:
@@ -2823,9 +3141,10 @@ class OpenInvoicesWindow(tk.Toplevel):
             "name": "Cliente",
             "issue_date": "Data",
             "due_date": "Vencimento",
-            "amount": "Valor",
-            "discount": "Desconto",
-            "open_balance": "Saldo em aberto",
+            "open_balance": "Valor da fatura",
+            "signed_doc": "Assinado",
+            "boleto": "Boleto",
+            "nota_fiscal": "NF",
         }
         for col, label in labels.items():
             suffix = ""
@@ -2839,7 +3158,7 @@ class OpenInvoicesWindow(tk.Toplevel):
         grouped = {}
         for row in rows:
             if mode == "customer":
-                key = (row.company, row.customer_id, row.customer_code, row.customer_name, row.account_code, row.account_name)
+                key = (row.customer_code, row.customer_name)
             elif mode == "due_date":
                 key = (row.company, row.due_date)
             elif mode == "account_group":
@@ -2849,22 +3168,24 @@ class OpenInvoicesWindow(tk.Toplevel):
             if key not in grouped:
                 if mode == "customer":
                     grouped[key] = InvoiceRow(
-                        invoice_id=f"grp_customer_{row.company}_{row.customer_id}_{row.account_code}",
+                        invoice_id=f"grp_customer_{row.customer_code}",
                         company=row.company,
                         customer_id=row.customer_id,
                         customer_code=row.customer_code,
                         customer_name=row.customer_name,
                         motive_code="",
                         motive_name="",
-                        account_code=row.account_code,
-                        account_name=row.account_name,
+                        account_code="",
+                        account_name="Várias Contas",
                         issue_date=None,
                         due_date=None,
                         amount=0,
                         discount_amount=0,
                         paid_amount=0,
                         open_balance=0,
+                        customer_email=row.customer_email,
                     )
+                    grouped[key].original_rows = []
                 elif mode == "due_date":
                     grouped[key] = InvoiceRow(
                         invoice_id=f"grp_due_{row.company}_{row.due_date}",
@@ -2905,6 +3226,11 @@ class OpenInvoicesWindow(tk.Toplevel):
             grouped[key].discount_amount = float(grouped[key].discount_amount or 0) + float(row.discount_amount or 0)
             grouped[key].paid_amount = float(grouped[key].paid_amount or 0) + float(row.paid_amount or 0)
             grouped[key].open_balance = float(grouped[key].open_balance or 0) + float(row.open_balance or 0)
+            grouped[key].has_signed_doc = bool(getattr(grouped[key], "has_signed_doc", False) or getattr(row, "has_signed_doc", False))
+            grouped[key].has_boleto = bool(getattr(grouped[key], "has_boleto", False) or getattr(row, "has_boleto", False))
+            grouped[key].has_nota_fiscal = bool(getattr(grouped[key], "has_nota_fiscal", False) or getattr(row, "has_nota_fiscal", False))
+            if hasattr(grouped[key], "original_rows"):
+                grouped[key].original_rows.append(row)
         return list(grouped.values())
     def load_data(self):
         if self._loading:
@@ -2926,12 +3252,33 @@ class OpenInvoicesWindow(tk.Toplevel):
         self._loading = True
 
         def _work():
-            return Database(self.config_data).list_open_invoices(
+            db = Database(self.config_data)
+            invoices = db.list_open_invoices(
                 due_date_from=date_from,
                 due_date_to=date_to,
                 customer_id=customer_id,
                 account_code=account_code,
             )
+            invoice_ids = [r.get("movto_id") for r in (invoices or [])]
+            try:
+                sig_map = db.get_sale_signatures_pdf_bulk(invoice_ids)
+            except Exception:
+                sig_map = {}
+            try:
+                boleto_map = db.check_boleto_exists_bulk(invoice_ids)
+            except Exception:
+                boleto_map = {}
+            try:
+                nf_map = db.check_nota_fiscal_exists_bulk(invoice_ids)
+            except Exception:
+                nf_map = {}
+            for r in (invoices or []):
+                inv_id = r.get("movto_id")
+                sig = sig_map.get(inv_id) or sig_map.get(str(inv_id)) or {}
+                r["has_signed_doc"] = bool(sig.get("exists") or (sig.get("attachments") or []))
+                r["has_boleto"] = bool(boleto_map.get(inv_id) or boleto_map.get(str(inv_id)))
+                r["has_nota_fiscal"] = bool(nf_map.get(inv_id) or nf_map.get(str(inv_id)))
+            return invoices
 
         def _ok(data):
             self._apply_invoices_data(data)
@@ -2959,27 +3306,52 @@ class OpenInvoicesWindow(tk.Toplevel):
         if not row:
             messagebox.showwarning(APP_TITLE, "Selecione uma fatura na grade.", parent=self)
             return
-        if self.GROUP_OPTIONS.get(self.group_by_var.get()) != "none" or str(row.invoice_id).startswith("grp_"):
-            messagebox.showwarning(APP_TITLE, "Para enviar e-mail, selecione uma linha detalhada sem agrupamento.", parent=self)
-            return
-        if not row.customer_id:
-            messagebox.showwarning(APP_TITLE, "Não foi possível identificar o cliente da linha selecionada.", parent=self)
-            return
-        email = str(row.customer_email or "").strip()
-        if email:
-            EmailComposeWindow(self, self.config_data, self.current_user, row, email)
-            return
 
-        def _work():
-            return Database(self.config_data).get_customer_email(row.customer_id)
+        is_grouped = self.GROUP_OPTIONS.get(self.group_by_var.get()) != "none" or str(row.invoice_id).startswith("grp_")
+        
+        if is_grouped:
+            if not getattr(row, "original_rows", []):
+                messagebox.showwarning(APP_TITLE, "Não há faturas detalhadas para este agrupamento.", parent=self)
+                return
+            target_rows = row.original_rows
+        else:
+            target_rows = [row]
 
-        def _ok(found_email):
-            EmailComposeWindow(self, self.config_data, self.current_user, row, str(found_email or "").strip())
+        def _open_for_row(idx: int):
+            if idx >= len(target_rows):
+                return
+            r = target_rows[idx]
+            if not r.customer_id:
+                messagebox.showwarning(APP_TITLE, f"Não foi possível identificar o cliente da fatura {r.invoice_id}.", parent=self)
+                _open_for_row(idx + 1)
+                return
+            
+            email = str(r.customer_email or "").strip()
+            if email:
+                win = EmailComposeWindow(self, self.config_data, self.current_user, r, email)
+                self.wait_window(win)
+                _open_for_row(idx + 1)
+                return
 
-        def _err(e: Exception):
-            messagebox.showerror(APP_TITLE, f"Erro ao buscar o e-mail do cliente:\n\n{e}", parent=self)
+            def _work():
+                return Database(self.config_data).get_customer_email(r.customer_id)
 
-        run_with_busy(self, "Buscando e-mail do cliente...", _work, _ok, _err)
+            def _ok(found_email):
+                win = EmailComposeWindow(self, self.config_data, self.current_user, r, str(found_email or "").strip())
+                self.wait_window(win)
+                _open_for_row(idx + 1)
+
+            def _err(e: Exception):
+                messagebox.showerror(APP_TITLE, f"Erro ao buscar o e-mail do cliente para fatura {r.invoice_id}:\n\n{e}", parent=self)
+                _open_for_row(idx + 1)
+
+            run_with_busy(self, f"Buscando e-mail... ({idx+1}/{len(target_rows)})", _work, _ok, _err)
+
+        if is_grouped:
+            if not messagebox.askyesno(APP_TITLE, f"Esta linha agrupada contém {len(target_rows)} fatura(s).\nDeseja enviar e-mails separadamente para cada uma?", parent=self):
+                return
+                
+        _open_for_row(0)
 
     def _row_values(self, row: InvoiceRow):
         return (
@@ -2989,9 +3361,10 @@ class OpenInvoicesWindow(tk.Toplevel):
             row.customer_name,
             row.issue_date_display(),
             row.due_date_display(),
-            row.amount_display(),
-            row.discount_amount_display(),
             row.open_balance_display(),
+            "Sim" if getattr(row, "has_signed_doc", False) else "Não",
+            "Sim" if getattr(row, "has_boleto", False) else "Não",
+            "Sim" if getattr(row, "has_nota_fiscal", False) else "Não",
         )
     def _refresh_tree(self):
         for item in self.tree.get_children():
@@ -4241,6 +4614,12 @@ class FinanceiroAlertaWindow(tk.Toplevel):
         except Exception:
             signature_map = {}
 
+        nfe_map: Dict[Any, Dict[str, Any]] = {}
+        try:
+            nfe_map = Database(self.config_data).get_nfe_attachments_bulk(invoice_ids)
+        except Exception:
+            nfe_map = {}
+
         grouped: Dict[str, Dict[str, Any]] = {}
         for inv in invoices:
             cid = inv.customer_id
@@ -4296,7 +4675,7 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                                 data = build_boleto_pdf_bytes(boleto_data, inv, include_pix_qrcode=include_pix_qrcode)
                             except Exception:
                                 data = None
-                                if attachment_data:
+                                if include_pix_qrcode and attachment_data:
                                     try:
                                         data = bytes(attachment_data)
                                     except Exception:
@@ -4320,6 +4699,30 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                 sig_bytes = sig.get("attachment_data")
                 if not sig_added and sig.get("exists") and sig_bytes:
                     attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+                nfe = nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}
+                nfe_atts = list((nfe.get("attachments") or []))
+                has_pdf = bool([a for a in nfe_atts if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
+                for a in nfe_atts:
+                    if has_pdf:
+                        break
+                    ndata = a.get("data")
+                    nname = str(a.get("filename") or "").lower()
+                    if not ndata or not nname.endswith(".xml"):
+                        continue
+                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(ndata, fallback_suffix=str(inv.invoice_id))
+                    if pdf_bytes and pdf_name:
+                        nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
+                        has_pdf = True
+                for a in (nfe.get("attachments") or []):
+                    ndata = a.get("data")
+                    nname = a.get("filename")
+                    if ndata and nname:
+                        attachments.append((ndata, nname))
+                for a in nfe_atts:
+                    ndata = a.get("data")
+                    nname = a.get("filename")
+                    if ndata and nname and (ndata, nname) not in attachments:
+                        attachments.append((ndata, nname))
             attachments_total += len(attachments)
             missing_total += missing
 
@@ -4332,7 +4735,6 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                 purchase_map = Database(self.config_data).get_purchase_info_bulk(invoice_ids)
             except Exception:
                 purchase_map = {}
-            text_body, html_body = build_due_alert_email_body(invs[0].customer_name, base_date, invs, missing, self._get_extra_body(), purchase_info_map=purchase_map)
             subject = f"Alerta de vencimento de boleto - {invs[0].customer_name}"
 
             max_attachments = 18
@@ -4355,8 +4757,18 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                 if not first_email and delay_seconds > 0:
                     time_module.sleep(delay_seconds)
                 first_email = False
+                flags = _detect_email_attachment_flags([name for data, name in batch if data])
+                text_body, html_body = build_due_alert_email_body(
+                    invs[0].customer_name,
+                    base_date,
+                    invs,
+                    missing,
+                    self._get_extra_body(),
+                    purchase_info_map=purchase_map,
+                    attachment_flags=flags,
+                )
                 msg = EmailMessage()
-                msg["From"] = smtp_email
+                msg["From"] = format_smtp_from(smtp_cfg) or smtp_email
                 msg["To"] = to_email
                 msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
                 msg.set_content(text_body)
@@ -4438,6 +4850,218 @@ class FinanceiroAlertaWindow(tk.Toplevel):
         self.destroy()
 
 
+class FinanceiroProblemasDocumentosWindow(tk.Toplevel):
+    def __init__(self, parent: tk.Tk):
+        super().__init__(parent)
+        self.title(f"{APP_TITLE} - Central de alertas")
+        self.geometry("900x500")
+        self.minsize(800, 400)
+        self.transient(parent)
+        self.grab_set()
+        self._build_ui()
+        self._load_data()
+        self._center_window()
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(16, 12, 16, 0))
+        header.pack(fill="x")
+        ttk.Label(header, text="Central de alertas", font=("Segoe UI", 14, "bold"), foreground="#dc2626").pack(side="left")
+
+        body = ttk.Frame(self, padding=(12, 10, 12, 10))
+        body.pack(fill="both", expand=True)
+
+        columns = ("boleto_grid", "documento", "customer_email", "status", "error")
+        self.tree = ttk.Treeview(body, columns=columns, show="headings")
+        self.tree.heading("boleto_grid", text="ID Boleto")
+        self.tree.column("boleto_grid", width=80, anchor="center")
+        self.tree.heading("documento", text="Documento")
+        self.tree.column("documento", width=120, anchor="center")
+        self.tree.heading("customer_email", text="E-mail")
+        self.tree.column("customer_email", width=200, anchor="w")
+        self.tree.heading("status", text="Status")
+        self.tree.column("status", width=100, anchor="center")
+        self.tree.heading("error", text="Mensagem")
+        self.tree.column("error", width=350, anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        vsb.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=vsb.set)
+        
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+    def _load_data(self):
+        from app_core.documents_history import DocumentsHistory
+        history = DocumentsHistory()
+        problems = history.list_problems()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for p in problems:
+            self.tree.insert("", "end", values=(p.boleto_grid, p.documento, p.customer_email, p.status, p.error))
+
+    def _on_double_click(self, event):
+        item = self.tree.selection()
+        if not item:
+            return
+        values = self.tree.item(item[0], "values")
+        if values and len(values) >= 5:
+            error_msg = values[4]
+            messagebox.showinfo("Detalhes do alerta", error_msg, parent=self)
+
+    def _center_window(self, min_x: int = 20, min_y: int = 20):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        width = max(self.winfo_width(), self.winfo_reqwidth())
+        height = max(self.winfo_height(), self.winfo_reqheight())
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = int((screen_w - width) / 2)
+        y = int((screen_h - height) / 2)
+        self.geometry(f"+{max(x, min_x)}+{max(y, min_y)}")
+
+class FinanceiroEnviadosDocumentosWindow(tk.Toplevel):
+    def __init__(self, parent: tk.Tk, config_data: Optional[Dict[str, Any]] = None):
+        super().__init__(parent)
+        self.config_data = config_data if isinstance(config_data, dict) else {}
+        self.title(f"{APP_TITLE} - Documentos enviados")
+        self.geometry("960x520")
+        self.minsize(860, 420)
+        self.transient(parent)
+        self.grab_set()
+        self._build_ui()
+        self._load_data()
+        self._center_window()
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(16, 12, 16, 0))
+        header.pack(fill="x")
+        ttk.Label(header, text="Documentos enviados", font=("Segoe UI", 14, "bold"), foreground="#16a34a").pack(side="left")
+        ttk.Button(header, text="Atualizar", command=self._load_data).pack(side="right")
+        ttk.Button(header, text="Limpar seleção p/ reenviar", command=self._clear_selected).pack(side="right", padx=(0, 8))
+
+        body = ttk.Frame(self, padding=(12, 10, 12, 10))
+        body.pack(fill="both", expand=True)
+
+        columns = ("sent_at", "boleto_grid", "documento", "customer_name", "customer_email")
+        self.tree = ttk.Treeview(body, columns=columns, show="headings")
+        self.tree.heading("sent_at", text="Enviado em")
+        self.tree.column("sent_at", width=160, anchor="center")
+        self.tree.heading("boleto_grid", text="ID Boleto")
+        self.tree.column("boleto_grid", width=90, anchor="center")
+        self.tree.heading("documento", text="Documento")
+        self.tree.column("documento", width=140, anchor="center")
+        self.tree.heading("customer_name", text="Cliente")
+        self.tree.column("customer_name", width=260, anchor="w")
+        self.tree.heading("customer_email", text="E-mail")
+        self.tree.column("customer_email", width=300, anchor="w")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        vsb.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=vsb.set)
+
+    def _center_window(self, min_x: int = 20, min_y: int = 20):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        width = max(self.winfo_width(), self.winfo_reqwidth())
+        height = max(self.winfo_height(), self.winfo_reqheight())
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = int((screen_w - width) / 2)
+        y = int((screen_h - height) / 2)
+        self.geometry(f"+{max(x, min_x)}+{max(y, min_y)}")
+
+    def _load_data(self):
+        def _work():
+            from app_core.documents_history import DocumentsHistory
+
+            rows = DocumentsHistory().list_sent(limit=1000)
+            name_by_grid: Dict[str, str] = {}
+
+            try:
+                missing_grids = [r.boleto_grid for r in rows if not str(r.customer_name or "").strip()]
+                if missing_grids and isinstance(self.config_data, dict) and self.config_data:
+                    from app_core.database import Database
+
+                    db_rows = Database(self.config_data).list_boletos_by_grids(missing_grids, include_closed=True)
+                    for d in db_rows or []:
+                        bg = str(d.get("boleto_grid") or "").strip()
+                        cliente = str(d.get("cliente") or "").strip()
+                        if bg and cliente and bg not in name_by_grid:
+                            name_by_grid[bg] = cliente
+            except Exception:
+                pass
+
+            return {"rows": rows, "name_by_grid": name_by_grid}
+
+        def _ok(out):
+            rows = out.get("rows") if isinstance(out, dict) else []
+            name_by_grid = out.get("name_by_grid") if isinstance(out, dict) else {}
+            if not isinstance(rows, list):
+                rows = []
+            if not isinstance(name_by_grid, dict):
+                name_by_grid = {}
+
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            for r in rows:
+                customer_name = str(getattr(r, "customer_name", "") or "").strip()
+                if not customer_name:
+                    bg = str(getattr(r, "boleto_grid", "") or "").strip()
+                    customer_name = str(name_by_grid.get(bg) or "")
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        getattr(r, "sent_at", ""),
+                        getattr(r, "boleto_grid", ""),
+                        getattr(r, "documento", ""),
+                        customer_name,
+                        getattr(r, "customer_email", ""),
+                    ),
+                )
+
+        def _err(e: Exception):
+            messagebox.showerror(APP_TITLE, f"Falha ao carregar histórico:\n\n{e}", parent=self)
+
+        run_with_busy(self, "Carregando...", _work, _ok, _err)
+
+    def _clear_selected(self):
+        selected = list(self.tree.selection() or [])
+        if not selected:
+            messagebox.showinfo(APP_TITLE, "Selecione um ou mais itens para limpar do histórico e reenviar.", parent=self)
+            return
+        grids: List[str] = []
+        for iid in selected:
+            values = self.tree.item(iid, "values")
+            if values and len(values) >= 2:
+                bg = str(values[1] or "").strip()
+                if bg:
+                    grids.append(bg)
+        grids = sorted(set(grids))
+        if not grids:
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"Limpar {len(grids)} item(ns) do histórico de enviados para permitir reenviar?\n\n"
+            f"Isso remove o status 'enviado' e volta para pendente.",
+            parent=self,
+        ):
+            return
+        try:
+            from app_core.documents_history import DocumentsHistory
+
+            DocumentsHistory().reset_to_pending(grids)
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Falha ao limpar histórico:\n\n{e}", parent=self)
+            return
+        self._load_data()
+        messagebox.showinfo(APP_TITLE, "Histórico limpo. Esses documentos poderão ser reenviados.", parent=self)
+
 class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
     def __init__(self, master, config_data: Dict[str, Any], current_user: str, on_config_saved):
         super().__init__(master)
@@ -4446,22 +5070,36 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
         self.current_user = current_user
         self.on_config_saved = on_config_saved
         self._run_thread = None
+        self._info_refresh_after_id = None
         self.status_var = tk.StringVar(value="Pronto.")
         self.enabled_var = tk.BooleanVar(value=False)
         self.interval_var = tk.StringVar(value="4")
-        self.no_email_retry_var = tk.StringVar(value="24")
+        self.first_run_time_var = tk.StringVar(value="")
+        self.send_pix_qrcode_var = tk.BooleanVar(value=False)
         self.batch_size_var = tk.StringVar(value="2000")
         self.last_scan_var = tk.StringVar(value="")
         self.last_run_var = tk.StringVar(value="")
+        self.next_run_var = tk.StringVar(value="")
         self.last_result_var = tk.StringVar(value="")
+        self._first_run_time_saved_raw = ""
+        self._schedule_anchor_saved_raw = ""
         self.title(f"{APP_TITLE} - Envio automático de documentos")
-        self.geometry("980x560")
-        self.minsize(820, 520)
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(1280, sw - 60)
+        h = min(900, sh - 80)
+        w = max(980, w)
+        h = max(720, h)
+        w = min(w, sw - 20)
+        h = min(h, sh - 60)
+        self.geometry(f"{w}x{h}")
+        self.minsize(min(980, w), min(680, h))
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._build_ui()
         self._center_window()
         self._load_from_config()
+        self._start_info_refresh_loop()
 
     def _center_window(self):
         self.update_idletasks()
@@ -4482,10 +5120,13 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
         cfg = self._auto_cfg()
         self.enabled_var.set(bool(cfg.get("enabled", False)))
         self.interval_var.set(str(cfg.get("interval_hours") or 4).strip() or "4")
-        self.no_email_retry_var.set(str(cfg.get("no_email_retry_hours") or 24).strip() or "24")
+        self.first_run_time_var.set(str(cfg.get("first_run_time") or "").strip())
+        self.send_pix_qrcode_var.set(bool(cfg.get("send_pix_qrcode", False)))
         self.batch_size_var.set(str(cfg.get("pending_batch_size") or 2000).strip() or "2000")
         self.last_scan_var.set(str(cfg.get("last_scan_end") or "").strip())
         self.last_run_var.set(str(cfg.get("last_run_at") or "").strip())
+        self._first_run_time_saved_raw = str(cfg.get("first_run_time") or "").strip()
+        self._schedule_anchor_saved_raw = str(cfg.get("schedule_anchor_at") or "").strip()
         lr = cfg.get("last_result") if isinstance(cfg.get("last_result"), dict) else {}
         if lr:
             self.last_result_var.set(
@@ -4495,18 +5136,152 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
             self.last_result_var.set("")
         self.extra_text.delete("1.0", "end")
         self.extra_text.insert("1.0", str(cfg.get("extra_body") or ""))
+        self._update_next_run_var()
+
+    def _parse_first_run_time_value(self, raw: str):
+        from datetime import datetime
+
+        raw = str(raw or "").strip().lower().replace(" ", "")
+        if not raw:
+            return None
+        raw = raw.replace("h", ":")
+        if raw.endswith(":"):
+            raw = raw + "00"
+        if ":" not in raw:
+            raw = raw + ":00"
+        parts = raw.split(":")
+        if len(parts) >= 2:
+            raw = f"{parts[0]}:{parts[1]}"
+        try:
+            return datetime.strptime(raw, "%H:%M").time()
+        except Exception:
+            return None
+
+    def _on_first_run_time_focus_out(self, event=None):
+        raw = str(self.first_run_time_var.get() or "").strip()
+        t = self._parse_first_run_time_value(raw)
+        if t is not None:
+            self.first_run_time_var.set(t.strftime("%H:%M"))
+        self._update_next_run_var()
+
+    def _schedule_anchor_dt(self):
+        from datetime import datetime, date
+
+        current_raw = str(self.first_run_time_var.get() or "").strip()
+        t = self._parse_first_run_time_value(current_raw)
+        if t is None:
+            return None
+        if current_raw == self._first_run_time_saved_raw and self._schedule_anchor_saved_raw:
+            try:
+                return datetime.fromisoformat(self._schedule_anchor_saved_raw)
+            except Exception:
+                pass
+        return datetime.combine(date.today(), t)
+
+    def _interval_hours_value(self) -> int:
+        try:
+            interval_hours = int(str(self.interval_var.get() or "").strip() or 4)
+        except Exception:
+            interval_hours = 4
+        return max(1, min(72, interval_hours))
+
+    def _update_next_run_var(self):
+        from datetime import datetime, timedelta
+
+        if not bool(self.enabled_var.get()):
+            self.next_run_var.set("Desativado")
+            return
+        interval_hours = self._interval_hours_value()
+        now = datetime.now()
+        anchor_dt = self._schedule_anchor_dt()
+        last_run_at_raw = str(self.last_run_var.get() or "").strip()
+        last_run_at_dt = None
+        if last_run_at_raw:
+            try:
+                last_run_at_dt = datetime.fromisoformat(last_run_at_raw)
+            except Exception:
+                last_run_at_dt = None
+        if anchor_dt is not None:
+            if now < anchor_dt:
+                self.next_run_var.set(anchor_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                return
+            interval_td = timedelta(hours=interval_hours)
+            elapsed = now - anchor_dt
+            slots = int(elapsed.total_seconds() // interval_td.total_seconds()) if interval_td.total_seconds() > 0 else 0
+            due_slot_dt = anchor_dt + (interval_td * slots)
+            if last_run_at_dt is None or last_run_at_dt < due_slot_dt:
+                self.next_run_var.set(due_slot_dt.strftime("%Y-%m-%d %H:%M:%S") + " (atrasado)")
+                return
+            next_dt = due_slot_dt + interval_td
+            self.next_run_var.set(next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+            return
+        if last_run_at_dt is None:
+            due_dt = now
+        else:
+            due_dt = last_run_at_dt + timedelta(hours=interval_hours)
+        due_fmt = due_dt.strftime("%Y-%m-%d %H:%M:%S")
+        self.next_run_var.set(f"{due_fmt} (já pode executar)" if due_dt <= now else due_fmt)
+
+    def _refresh_last_info_from_disk(self):
+        try:
+            cfg = ConfigManager.load()
+            auto_cfg = cfg.get("financeiro_envio_auto_documentos")
+            if not isinstance(auto_cfg, dict):
+                return
+            self.last_scan_var.set(str(auto_cfg.get("last_scan_end") or "").strip())
+            self.last_run_var.set(str(auto_cfg.get("last_run_at") or "").strip())
+            self._first_run_time_saved_raw = str(auto_cfg.get("first_run_time") or "").strip()
+            self._schedule_anchor_saved_raw = str(auto_cfg.get("schedule_anchor_at") or "").strip()
+            lr = auto_cfg.get("last_result") if isinstance(auto_cfg.get("last_result"), dict) else {}
+            if lr:
+                self.last_result_var.set(
+                    f"docs_encontrados={lr.get('discovered')} pendentes_antes={lr.get('pending_before')} emails_planejados={lr.get('emails_planned')} emails_enviados={lr.get('emails_sent')} falhas_email={lr.get('failed_emails')} docs_enviados={lr.get('docs_sent')} docs_falha={lr.get('docs_failed')} sem_email={lr.get('docs_no_email')}"
+                )
+            else:
+                self.last_result_var.set("")
+        except Exception:
+            return
+
+    def _start_info_refresh_loop(self):
+        if self._info_refresh_after_id:
+            try:
+                self.after_cancel(self._info_refresh_after_id)
+            except Exception:
+                pass
+            self._info_refresh_after_id = None
+        self._info_refresh_after_id = self.after(30 * 1000, self._info_refresh_tick)
+
+    def _info_refresh_tick(self):
+        try:
+            self._refresh_last_info_from_disk()
+            self._update_next_run_var()
+        except Exception:
+            pass
+        try:
+            self._info_refresh_after_id = self.after(30 * 1000, self._info_refresh_tick)
+        except Exception:
+            self._info_refresh_after_id = None
 
     def _persist(self):
+        from datetime import datetime, date
+
         cfg = self._auto_cfg()
         cfg["enabled"] = bool(self.enabled_var.get())
         try:
             cfg["interval_hours"] = max(1, min(72, int(str(self.interval_var.get() or "").strip() or 4)))
         except Exception:
             cfg["interval_hours"] = 4
-        try:
-            cfg["no_email_retry_hours"] = max(1, min(24 * 30, int(str(self.no_email_retry_var.get() or "").strip() or 24)))
-        except Exception:
-            cfg["no_email_retry_hours"] = 24
+        first_raw = str(self.first_run_time_var.get() or "").strip()
+        parsed_time = self._parse_first_run_time_value(first_raw)
+        prev_time = str(cfg.get("first_run_time") or "").strip()
+        prev_anchor = str(cfg.get("schedule_anchor_at") or "").strip()
+        cfg["first_run_time"] = first_raw
+        if not first_raw:
+            cfg["schedule_anchor_at"] = ""
+        elif parsed_time is not None and (not prev_anchor or prev_time != first_raw):
+            anchor_dt = datetime.combine(date.today(), parsed_time)
+            cfg["schedule_anchor_at"] = anchor_dt.isoformat(timespec="seconds")
+        cfg["send_pix_qrcode"] = bool(self.send_pix_qrcode_var.get())
         try:
             cfg["pending_batch_size"] = max(50, min(5000, int(str(self.batch_size_var.get() or "").strip() or 2000)))
         except Exception:
@@ -4532,24 +5307,117 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"Falha ao abrir pasta:\n\n{e}", parent=self)
 
-    def _run(self, dry_run: bool):
+    def _open_sent(self):
+        FinanceiroEnviadosDocumentosWindow(self, self._build_runtime_payload())
+
+    def _build_runtime_payload(self) -> Dict[str, Any]:
+        payload = deepcopy(self.config_data)
+        auto_cfg = payload.get("financeiro_envio_auto_documentos")
+        if not isinstance(auto_cfg, dict):
+            auto_cfg = {}
+            payload["financeiro_envio_auto_documentos"] = auto_cfg
+        auto_cfg["enabled"] = bool(self.enabled_var.get())
+        try:
+            auto_cfg["interval_hours"] = int(str(self.interval_var.get() or "").strip() or 4)
+        except Exception:
+            auto_cfg["interval_hours"] = 4
+        auto_cfg["first_run_time"] = str(self.first_run_time_var.get() or "").strip()
+        auto_cfg["send_pix_qrcode"] = bool(self.send_pix_qrcode_var.get())
+        try:
+            auto_cfg["pending_batch_size"] = int(str(self.batch_size_var.get() or "").strip() or 2000)
+        except Exception:
+            auto_cfg["pending_batch_size"] = 2000
+        auto_cfg["extra_body"] = self.extra_text.get("1.0", "end").strip()
+        return payload
+
+    def _run(self, dry_run: bool, force: bool = False, allow_resend: bool = False):
         if self._run_thread is not None and getattr(self._run_thread, "is_alive", lambda: False)():
             return
 
         def _work():
             from app_core.auto_documents import run_auto_documents
-            payload = deepcopy(self.config_data) if dry_run else self.config_data
-            return run_auto_documents(payload, dry_run=dry_run, user_label=self.current_user)
+            payload = self._build_runtime_payload()
+            res = run_auto_documents(
+                payload,
+                dry_run=dry_run,
+                user_label=self.current_user,
+                force=bool(force),
+                allow_resend=bool(allow_resend),
+            )
+            return {"result": res, "payload": payload}
 
-        def _ok(res):
+        def _ok(out):
+            res = out.get("result") if isinstance(out, dict) else out
+            payload = out.get("payload") if isinstance(out, dict) else None
+            interval_raw = str(self.interval_var.get() or "")
+            batch_raw = str(self.batch_size_var.get() or "")
+            enabled_raw = bool(self.enabled_var.get())
+            extra_raw = self.extra_text.get("1.0", "end")
+
             if not dry_run:
                 try:
-                    self._persist()
+                    if isinstance(payload, dict):
+                        src = payload.get("financeiro_envio_auto_documentos")
+                        if isinstance(src, dict):
+                            dst = self._auto_cfg()
+                            dst["last_scan_end"] = src.get("last_scan_end")
+                            dst["last_run_at"] = src.get("last_run_at")
+                            dst["last_result"] = src.get("last_result")
+                            self.config_data["financeiro_envio_auto_documentos"] = dst
+                    ConfigManager.save(self.config_data)
+                    self.config_data = ConfigManager.load()
+                    self.on_config_saved(self.config_data)
                 except Exception:
                     pass
             self._load_from_config()
+            self.enabled_var.set(bool(enabled_raw))
+            self.interval_var.set(interval_raw)
+            self.batch_size_var.set(batch_raw)
+            self.extra_text.delete("1.0", "end")
+            self.extra_text.insert("1.0", str(extra_raw or ""))
+            self._update_next_run_var()
             self.status_var.set("Concluído.")
             title = "Simulação concluída" if dry_run else "Execução concluída"
+            if isinstance(res, dict) and res.get("skipped"):
+                reason = str(res.get("reason") or "").strip()
+                if reason == "disabled":
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "Envio não executado porque o envio automático está desativado.\n\nMarque \"Ativar envio automático\" e clique em Salvar para habilitar a execução automática. Para executar uma vez manualmente, use \"Executar agora\".",
+                        parent=self,
+                    )
+                    return
+                if reason == "already_running":
+                    messagebox.showinfo(APP_TITLE, "Envio não executado porque já existe uma execução em andamento.", parent=self)
+                    return
+            if isinstance(res, dict):
+                sent_to = res.get("sent_to") if isinstance(res.get("sent_to"), list) else []
+                sent_to_text = ", ".join([str(x) for x in sent_to if str(x).strip()]) if sent_to else ""
+                planned_to = res.get("planned_to") if isinstance(res.get("planned_to"), list) else []
+                planned_to_text = ", ".join([str(x) for x in planned_to if str(x).strip()]) if planned_to else ""
+                skipped_dups = int(res.get("skipped_duplicates") or 0)
+                already_sent = int(res.get("already_sent") or 0)
+                lines = [
+                    title + ".",
+                    "",
+                    f"Docs encontrados: {res.get('discovered')}",
+                    f"Pendentes antes: {res.get('pending_before')}",
+                    f"E-mails planejados: {res.get('emails_planned')}",
+                    f"E-mails enviados: {res.get('emails_sent')} (falhas: {res.get('failed_emails')})",
+                    f"Docs enviados: {res.get('docs_sent')} (falhas: {res.get('docs_failed')})",
+                    f"Sem e-mail: {res.get('docs_no_email')}",
+                ]
+                if (skipped_dups + already_sent) > 0:
+                    lines.append(f"Duplicados ignorados: {skipped_dups + already_sent}")
+                if planned_to_text:
+                    lines.append(f"Planejado para: {planned_to_text}")
+                if sent_to_text:
+                    lines.append(f"Enviado para: {sent_to_text}")
+                if not dry_run and int(res.get("emails_sent") or 0) > 0 and int(res.get("failed_emails") or 0) == 0:
+                    lines.append("")
+                    lines.append("Se não chegou, verifique Spam/Lixo eletrônico. Para ver os logs, use o botão Abrir pasta do app (docs_sent.log e system.log).")
+                messagebox.showinfo(APP_TITLE, "\n".join(lines), parent=self)
+                return
             messagebox.showinfo(APP_TITLE, f"{title}.\n\n{res}", parent=self)
 
         def _err(e: Exception):
@@ -4557,8 +5425,7 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
             messagebox.showerror(APP_TITLE, f"Erro:\n\n{e}", parent=self)
 
         self.status_var.set("Processando...")
-        self._run_thread = threading.Thread(target=lambda: run_with_busy(self, "Processando...", _work, _ok, _err), daemon=True)
-        self._run_thread.start()
+        self._run_thread = run_with_busy(self, "Processando...", _work, _ok, _err)
 
     def _simulate(self):
         self._run(True)
@@ -4566,7 +5433,55 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
     def _run_now(self):
         if not messagebox.askyesno(APP_TITLE, "Deseja executar o envio agora?", parent=self):
             return
-        self._run(False)
+        allow_resend = False
+        try:
+            from datetime import datetime, timedelta
+            from app_core.database import Database
+            from app_core.documents_history import DocumentsHistory
+
+            payload = self._build_runtime_payload()
+            auto_cfg = payload.get("financeiro_envio_auto_documentos") if isinstance(payload.get("financeiro_envio_auto_documentos"), dict) else {}
+            try:
+                interval_hours = int(auto_cfg.get("interval_hours") or 4)
+            except Exception:
+                interval_hours = 4
+            now = datetime.now()
+            window_start = now - timedelta(hours=interval_hours)
+            rows = Database(payload).list_generated_boletos(window_start, now)
+            grids = [str(r.get("boleto_grid") or "").strip() for r in rows if str(r.get("boleto_grid") or "").strip()]
+            movto_ids = [str(r.get("movto_id") or "").strip() for r in rows if str(r.get("movto_id") or "").strip()]
+            history = DocumentsHistory()
+            sent_by_grid = history.list_sent_by_grids(grids)
+            sent_by_movto = history.list_sent_by_movto_ids(movto_ids)
+            duplicates = []
+            for r in rows:
+                bg = str(r.get("boleto_grid") or "").strip()
+                mid = str(r.get("movto_id") or "").strip()
+                rec = sent_by_grid.get(bg) or (sent_by_movto.get(mid) if mid else None)
+                if not rec:
+                    continue
+                duplicates.append(
+                    {
+                        "cliente": str(r.get("cliente") or "").strip(),
+                        "documento": str(r.get("documento") or "").strip(),
+                        "email": str(r.get("customer_email") or "").strip(),
+                        "sent_at": str(rec.sent_at or "").strip(),
+                    }
+                )
+            if duplicates:
+                preview = []
+                for d in duplicates[:5]:
+                    preview.append(f"- {d.get('cliente') or '-'} | {d.get('documento') or '-'} | {d.get('email') or '-'} | enviado em {d.get('sent_at') or '-'}")
+                msg = (
+                    f"Foram encontrados {len(duplicates)} documentos que já constam como enviados no histórico.\n\n"
+                    f"Deseja reenviar mesmo assim?\n\n"
+                    + "\n".join(preview)
+                    + ("\n\n(Exibindo até 5 exemplos.)" if len(duplicates) > 5 else "")
+                )
+                allow_resend = bool(messagebox.askyesno(APP_TITLE, msg, parent=self))
+        except Exception:
+            allow_resend = False
+        self._run(False, force=True, allow_resend=allow_resend)
 
     def _build_ui(self):
         header = ttk.Frame(self, padding=(16, 12, 16, 0))
@@ -4579,51 +5494,138 @@ class FinanceiroEnvioAutomaticoDocumentosWindow(tk.Toplevel):
         ttk.Button(top, text="Simular", command=self._simulate).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="Executar agora", command=self._run_now).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="Abrir pasta do app", command=self._open_app_folder).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="Ver enviados", command=self._open_sent).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="Voltar ao início", command=self._close).pack(side="right")
 
         body = ttk.Frame(self, padding=(12, 0, 12, 10))
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
-        body.rowconfigure(3, weight=1)
+        body.rowconfigure(5, weight=1)
 
         ttk.Checkbutton(body, text="Ativar envio automático", variable=self.enabled_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         ttk.Label(body, text="Intervalo (horas)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
         ttk.Entry(body, textvariable=self.interval_var, width=12).grid(row=1, column=1, sticky="w", pady=5)
 
+        ttk.Label(body, text="Primeira execução (HH:MM)").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=5)
+        self.first_run_time_entry = ttk.Entry(body, textvariable=self.first_run_time_var, width=12)
+        self.first_run_time_entry.grid(row=2, column=1, sticky="w", pady=5)
+        bind_time_entry_shortcuts(self.first_run_time_entry)
+        self.first_run_time_entry.bind("<FocusOut>", self._on_first_run_time_focus_out, add="+")
+
+        ttk.Checkbutton(body, text="Incluir QRCode PIX no boleto (PDF)", variable=self.send_pix_qrcode_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
         adv = ttk.Frame(body)
-        adv.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(adv, text="Retentar sem e-mail (h)").pack(side="left")
-        ttk.Entry(adv, textvariable=self.no_email_retry_var, width=8).pack(side="left", padx=(8, 16))
+        adv.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Label(adv, text="Lote pendências").pack(side="left")
         ttk.Entry(adv, textvariable=self.batch_size_var, width=10).pack(side="left", padx=(8, 0))
+        ttk.Button(adv, text="Listar documentos do período", command=self._list_boletos).pack(side="left", padx=(16, 0))
+
+        list_box = ttk.LabelFrame(body, text="Documentos gerados no período", padding=10)
+        list_box.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        list_box.rowconfigure(0, weight=1)
+        list_box.columnconfigure(0, weight=1)
+
+        columns = ("boleto_grid", "documento", "cliente", "customer_email", "generated_at", "valor")
+        self.boletos_tree = ttk.Treeview(list_box, columns=columns, show="headings", height=10)
+        self.boletos_tree.heading("boleto_grid", text="ID")
+        self.boletos_tree.column("boleto_grid", width=80, anchor="center")
+        self.boletos_tree.heading("documento", text="Documento")
+        self.boletos_tree.column("documento", width=120, anchor="center")
+        self.boletos_tree.heading("cliente", text="Cliente")
+        self.boletos_tree.column("cliente", width=220, anchor="w")
+        self.boletos_tree.heading("customer_email", text="E-mail")
+        self.boletos_tree.column("customer_email", width=250, anchor="w")
+        self.boletos_tree.heading("generated_at", text="Gerado em")
+        self.boletos_tree.column("generated_at", width=150, anchor="center")
+        self.boletos_tree.heading("valor", text="Valor")
+        self.boletos_tree.column("valor", width=110, anchor="e")
+        self.boletos_tree.grid(row=0, column=0, sticky="nsew")
+        
+        tree_vsb = ttk.Scrollbar(list_box, orient="vertical", command=self.boletos_tree.yview)
+        tree_vsb.grid(row=0, column=1, sticky="ns")
+        self.boletos_tree.configure(yscrollcommand=tree_vsb.set)
 
         extra_box = ttk.LabelFrame(body, text="Texto extra do e-mail", padding=10)
-        extra_box.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
+        extra_box.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
         extra_box.rowconfigure(0, weight=1)
         extra_box.columnconfigure(0, weight=1)
-        self.extra_text = tk.Text(extra_box, wrap="word", height=8)
+        self.extra_text = tk.Text(extra_box, wrap="word", height=4)
         self.extra_text.grid(row=0, column=0, sticky="nsew")
         vsb = ttk.Scrollbar(extra_box, orient="vertical", command=self.extra_text.yview)
         vsb.grid(row=0, column=1, sticky="ns")
         self.extra_text.configure(yscrollcommand=vsb.set)
 
         info = ttk.LabelFrame(body, text="Última execução", padding=10)
-        info.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        info.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         info.columnconfigure(1, weight=1)
         ttk.Label(info, text="Último scan até").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Label(info, textvariable=self.last_scan_var).grid(row=0, column=1, sticky="w", pady=4)
         ttk.Label(info, text="Última execução").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Label(info, textvariable=self.last_run_var).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Label(info, text="Resultado").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(info, textvariable=self.last_result_var, wraplength=820, justify="left").grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(info, text="Próxima execução prevista").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(info, textvariable=self.next_run_var).grid(row=2, column=1, sticky="w", pady=4)
+        ttk.Label(info, text="Resultado").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(info, textvariable=self.last_result_var, wraplength=1100, justify="left").grid(row=3, column=1, sticky="w", pady=4)
 
         bottom = ttk.Frame(self, padding=(12, 0, 12, 10))
         bottom.pack(fill="x")
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
         ttk.Label(bottom, text=f"Usuário: {self.current_user}").pack(side="right")
 
+    def _list_boletos(self):
+        try:
+            interval_hours = int(str(self.interval_var.get() or "").strip() or 4)
+        except Exception:
+            interval_hours = 4
+
+        def _work():
+            from app_core.database import Database
+            from datetime import datetime, timedelta
+            
+            now = datetime.now()
+            window_start = now - timedelta(hours=interval_hours)
+            
+            db = Database(self.config_data)
+            return db.list_generated_boletos(window_start, now)
+
+        def _ok(rows):
+            for item in self.boletos_tree.get_children():
+                self.boletos_tree.delete(item)
+            
+            for r in rows:
+                self.boletos_tree.insert(
+                    "", "end",
+                    values=(
+                        r.get("boleto_grid", ""),
+                        r.get("documento", ""),
+                        r.get("cliente", ""),
+                        r.get("customer_email", ""),
+                        r.get("generated_at", ""),
+                        money_br(r.get("valor"))
+                    )
+                )
+            self.status_var.set(f"{len(rows)} documentos encontrados nas últimas {interval_hours}h.")
+
+        def _err(e: Exception):
+            self.status_var.set("Falha ao buscar documentos.")
+            msg = str(e) if e else ""
+            if not msg and e is not None:
+                msg = getattr(e, "pgerror", "") or repr(e)
+            if not msg:
+                msg = "Erro desconhecido."
+            messagebox.showerror(APP_TITLE, f"Erro:\n\n{msg}", parent=self)
+
+        self.status_var.set("Buscando documentos...")
+        run_with_busy(self, "Buscando...", _work, _ok, _err)
+
     def _close(self):
+        if self._info_refresh_after_id:
+            try:
+                self.after_cancel(self._info_refresh_after_id)
+            except Exception:
+                pass
+            self._info_refresh_after_id = None
         self.destroy()
 
 class MainApp(tk.Tk):
@@ -4654,6 +5656,20 @@ class MainApp(tk.Tk):
         self._build_menu()
         self._build_frames()
         self._start_application_flow()
+        self._center_window()
+
+    def _center_window(self, min_x: int = 20, min_y: int = 20):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        width = max(self.winfo_width(), self.winfo_reqwidth())
+        height = max(self.winfo_height(), self.winfo_reqheight())
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = int((screen_w - width) / 2)
+        y = int((screen_h - height) / 2)
+        self.geometry(f"+{max(x, min_x)}+{max(y, min_y)}")
     def _setup_style(self):
         style = ttk.Style(self)
         try:
@@ -4665,6 +5681,8 @@ class MainApp(tk.Tk):
         style.configure("TFrame", background="#f5f7fb")
         style.configure("TLabel", background="#f5f7fb", foreground="#1f2937", font=base_font)
         style.configure("TButton", font=("Segoe UI", 9, "bold"), padding=(10, 6))
+        style.configure("Bell.TButton", font=("Segoe UI", 12, "bold"), padding=(6, 2), foreground="#374151", background="#f5f7fb")
+        style.configure("BellAlert.TButton", font=("Segoe UI", 12, "bold"), padding=(6, 2), foreground="#b91c1c", background="#fee2e2")
         self.configure(background="#f5f7fb")
     def _build_menu(self):
         menubar = tk.Menu(self)
@@ -4727,6 +5745,7 @@ class MainApp(tk.Tk):
     def _show_license_block(self, error_text: str):
         self.geometry("460x250")
         self.minsize(460, 250)
+        self._center_window()
         self.license_error_var.set(error_text)
         self._clear_frames()
         self.license_block_frame.pack(fill="both", expand=True)
@@ -4737,10 +5756,6 @@ class MainApp(tk.Tk):
     def _show_setup_user_frame(self):
         self._clear_frames()
         self.setup_user_frame.pack(fill="both", expand=True)
-    def show_home(self):
-        self._clear_frames()
-        self.home_frame.pack(fill="both", expand=True)
-        self._update_home_message()
     def _build_login_frame(self):
         card = ttk.Frame(self.login_frame, padding=20)
         card.place(relx=0.5, rely=0.5, anchor="center")
@@ -4784,12 +5799,46 @@ class MainApp(tk.Tk):
     def _build_home_frame(self):
         body = ttk.Frame(self.home_frame, padding=24)
         body.pack(fill="both", expand=True)
+        
+        self.bell_btn = ttk.Button(self.home_frame, text="🔔", style="Bell.TButton", command=self._open_problems_window)
+        self.bell_btn.place(relx=0.98, rely=0.02, anchor="ne")
+
         center = ttk.Frame(body)
         center.place(relx=0.5, rely=0.42, anchor="center")
         ttk.Label(center, text="DataHub", font=("Segoe UI", 18, "bold")).pack(anchor="center", pady=(0, 10))
         ttk.Label(center, text="Selecione uma opção no menu para abrir uma funcionalidade.", justify="center", wraplength=520).pack(anchor="center", pady=(0, 6))
         ttk.Label(center, textvariable=self.home_message_var, justify="center", wraplength=620).pack(anchor="center")
         ttk.Label(center, textvariable=self.user_var, justify="center").pack(anchor="center", pady=(16, 0))
+
+    def _open_problems_window(self):
+        if hasattr(self, 'problems_window') and self.problems_window and self.problems_window.winfo_exists():
+            self.problems_window.lift()
+            return
+        self.problems_window = FinanceiroProblemasDocumentosWindow(self)
+
+    def _check_problems(self):
+        if not self.current_user:
+            self.after(30000, self._check_problems)
+            return
+            
+        try:
+            from app_core.documents_history import DocumentsHistory
+            history = DocumentsHistory()
+            problems = history.list_problems()
+            if problems:
+                self.bell_btn.config(style="BellAlert.TButton")
+            else:
+                self.bell_btn.config(style="Bell.TButton")
+        except Exception:
+            pass
+        self.after(30000, self._check_problems)
+
+    def show_home(self):
+        self._clear_frames()
+        self.home_frame.pack(fill="both", expand=True)
+        self._update_home_message()
+        self._check_problems()
+
     def _update_home_message(self):
         name = ""
         if isinstance(self.license_data, dict):
@@ -4835,6 +5884,7 @@ class MainApp(tk.Tk):
             return
         self.geometry("900x520")
         self.minsize(700, 420)
+        self._center_window()
         self.show_home()
         self._start_financeiro_alert_loop()
         self._start_auto_docs_loop()
@@ -4873,6 +5923,7 @@ class MainApp(tk.Tk):
         self._update_menu_visibility()
         self.geometry("900x520")
         self.minsize(700, 420)
+        self._center_window()
         self.show_home()
         self._start_financeiro_alert_loop()
         self._start_auto_docs_loop()
@@ -5127,7 +6178,7 @@ class MainApp(tk.Tk):
                                         data = build_boleto_pdf_bytes(boleto_data, inv, include_pix_qrcode=include_pix_qrcode)
                                     except Exception:
                                         data = None
-                                        if attachment_data:
+                                        if include_pix_qrcode and attachment_data:
                                             try:
                                                 data = bytes(attachment_data)
                                             except Exception:
@@ -5161,7 +6212,6 @@ class MainApp(tk.Tk):
                         purchase_map = Database(self.config_data).get_purchase_info_bulk(invoice_ids)
                     except Exception:
                         purchase_map = {}
-                    text_body, html_body = build_due_alert_email_body(invs[0].customer_name, base_date, invs, missing, extra_body, purchase_info_map=purchase_map)
                     subject = f"Alerta de vencimento de boleto - {invs[0].customer_name}"
 
                     max_attachments = 18
@@ -5184,8 +6234,18 @@ class MainApp(tk.Tk):
                         if not first_email and delay_seconds > 0:
                             time_module.sleep(delay_seconds)
                         first_email = False
+                        flags = _detect_email_attachment_flags([name for data, name in batch if data])
+                        text_body, html_body = build_due_alert_email_body(
+                            invs[0].customer_name,
+                            base_date,
+                            invs,
+                            missing,
+                            extra_body,
+                            purchase_info_map=purchase_map,
+                            attachment_flags=flags,
+                        )
                         msg = EmailMessage()
-                        msg["From"] = smtp_email
+                        msg["From"] = format_smtp_from(smtp_cfg) or smtp_email
                         msg["To"] = to_email
                         msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
                         msg.set_content(text_body)
@@ -5262,6 +6322,8 @@ class MainApp(tk.Tk):
         self._auto_docs_after_id = self.after(5000, self._auto_docs_tick)
 
     def _auto_docs_tick(self):
+        from datetime import date
+
         self._auto_docs_after_id = self.after(60 * 1000, self._auto_docs_tick)
         if not self.current_user:
             return
@@ -5279,14 +6341,62 @@ class MainApp(tk.Tk):
         except Exception:
             interval_hours = 4
         interval_hours = max(1, min(72, interval_hours))
-        last_run_at_raw = str(auto_cfg.get("last_run_at") or "").strip()
-        if last_run_at_raw:
-            try:
-                last_run_at_dt = datetime.fromisoformat(last_run_at_raw)
-                if (datetime.now() - last_run_at_dt) < timedelta(hours=interval_hours):
+        first_run_time_raw = str(auto_cfg.get("first_run_time") or "").strip()
+        schedule_anchor_raw = str(auto_cfg.get("schedule_anchor_at") or "").strip()
+        if first_run_time_raw:
+            anchor_dt = None
+            if schedule_anchor_raw:
+                try:
+                    anchor_dt = datetime.fromisoformat(schedule_anchor_raw)
+                except Exception:
+                    anchor_dt = None
+            if anchor_dt is None:
+                raw = first_run_time_raw.lower().replace(" ", "").replace("h", ":")
+                if raw.endswith(":"):
+                    raw = raw + "00"
+                if ":" not in raw:
+                    raw = raw + ":00"
+                parts = raw.split(":")
+                if len(parts) >= 2:
+                    raw = f"{parts[0]}:{parts[1]}"
+                try:
+                    t = datetime.strptime(raw, "%H:%M").time()
+                    anchor_dt = datetime.combine(date.today(), t)
+                    auto_cfg["schedule_anchor_at"] = anchor_dt.isoformat(timespec="seconds")
+                    self.config_data["financeiro_envio_auto_documentos"] = auto_cfg
+                    try:
+                        ConfigManager.save(self.config_data)
+                    except Exception:
+                        pass
+                except Exception:
+                    anchor_dt = None
+            if anchor_dt is not None:
+                now = datetime.now()
+                if now < anchor_dt:
                     return
-            except Exception:
-                pass
+                interval_td = timedelta(hours=interval_hours)
+                elapsed = now - anchor_dt
+                slots = int(elapsed.total_seconds() // interval_td.total_seconds()) if interval_td.total_seconds() > 0 else 0
+                due_slot_dt = anchor_dt + (interval_td * slots)
+                last_run_at_raw = str(auto_cfg.get("last_run_at") or "").strip()
+                if last_run_at_raw:
+                    try:
+                        last_run_at_dt = datetime.fromisoformat(last_run_at_raw)
+                        if last_run_at_dt >= due_slot_dt:
+                            return
+                    except Exception:
+                        pass
+            else:
+                first_run_time_raw = ""
+        if not first_run_time_raw:
+            last_run_at_raw = str(auto_cfg.get("last_run_at") or "").strip()
+            if last_run_at_raw:
+                try:
+                    last_run_at_dt = datetime.fromisoformat(last_run_at_raw)
+                    if (datetime.now() - last_run_at_dt) < timedelta(hours=interval_hours):
+                        return
+                except Exception:
+                    pass
 
         def _run():
             self._auto_docs_running = True

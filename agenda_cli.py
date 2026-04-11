@@ -11,7 +11,8 @@ import re
 from app_core.audit import AuditLogger
 from app_core.config_manager import ConfigManager
 from app_core.database import Database
-from app_core.helpers import AppError
+from app_core.danfe import danfe_pdf_from_nfe_xml
+from app_core.helpers import AppError, format_smtp_from
 from app_core.logging_setup import get_system_logger, init_logging
 from app_core.models import InvoiceRow
 
@@ -43,6 +44,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
     if ext == "pdf":
         return "application", "pdf"
+    if ext == "xml":
+        return "application", "xml"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -146,9 +149,26 @@ def _default_body(inv: InvoiceRow, boleto_data: Dict[str, Any], attachment_bytes
         f"{inv.company}"
     )
 
-def _group_body(customer_name: str, base_date: date, invoices: List[InvoiceRow], total: float, missing_count: int, extra_body: str, purchase_map: Dict[Any, Dict[str, Any]]) -> tuple[str, str]:
+def _group_body(
+    customer_name: str,
+    base_date: date,
+    invoices: List[InvoiceRow],
+    total: float,
+    missing_count: int,
+    extra_body: str,
+    purchase_map: Dict[Any, Dict[str, Any]],
+    attachment_flags: Optional[Dict[str, bool]] = None,
+) -> tuple[str, str]:
     from ui import build_due_alert_email_body
-    return build_due_alert_email_body(customer_name, base_date, invoices, missing_count, extra_body, purchase_info_map=purchase_map)
+    return build_due_alert_email_body(
+        customer_name,
+        base_date,
+        invoices,
+        missing_count,
+        extra_body,
+        purchase_info_map=purchase_map,
+        attachment_flags=attachment_flags,
+    )
 
 
 def _generate_boleto_pdf_if_needed(boleto_data: Dict[str, Any], inv: InvoiceRow, include_pix_qrcode: bool) -> Tuple[Optional[bytes], str]:
@@ -160,7 +180,7 @@ def _generate_boleto_pdf_if_needed(boleto_data: Dict[str, Any], inv: InvoiceRow,
     try:
         return build_boleto_pdf_bytes(boleto_data, inv, include_pix_qrcode=include_pix_qrcode), filename
     except Exception:
-        return (attachment_data if attachment_data else None), filename
+        return (attachment_data if include_pix_qrcode and attachment_data else None), filename
 
 
 def _should_run_agenda(
@@ -251,6 +271,12 @@ def run_agenda(
     except Exception:
         signature_map = {}
 
+    nfe_map = {}
+    try:
+        nfe_map = Database(cfg).get_nfe_attachments_bulk(invoice_ids)
+    except Exception:
+        nfe_map = {}
+
     purchase_map = {}
     try:
         purchase_map = Database(cfg).get_purchase_info_bulk(invoice_ids)
@@ -337,13 +363,32 @@ def run_agenda(
             if not sig_added and sig.get("exists") and sig_bytes:
                 attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
 
+            nfe = nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}
+            nfe_atts = list((nfe.get("attachments") or []))
+            has_pdf = bool([a for a in nfe_atts if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
+            for a in nfe_atts:
+                if has_pdf:
+                    break
+                ndata = a.get("data")
+                nname = str(a.get("filename") or "").lower()
+                if not ndata or not nname.endswith(".xml"):
+                    continue
+                pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(ndata, fallback_suffix=str(inv.invoice_id))
+                if pdf_bytes and pdf_name:
+                    nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
+                    has_pdf = True
+            for a in nfe_atts:
+                ndata = a.get("data")
+                nname = a.get("filename")
+                if ndata and nname:
+                    attachments.append((ndata, nname))
+
         attachments_total += len(attachments)
         missing_total += missing
         if dry_run:
             continue
 
         subject = _subject_group(invs[0].customer_name)
-        text_body, html_body = _group_body(invs[0].customer_name, base_date, invs, total, missing, agenda.get("extra_body"), purchase_map=purchase_map)
 
         max_attachments = 18
         max_bytes = 15 * 1024 * 1024
@@ -365,9 +410,26 @@ def run_agenda(
             if not first_email and delay_seconds > 0:
                 time.sleep(delay_seconds)
             first_email = False
+            try:
+                from ui import _detect_email_attachment_flags
+
+                flags = _detect_email_attachment_flags([name for data, name in batch if data])
+            except Exception:
+                flags = {"boleto": False, "fatura_pdf": False, "xml": False, "danfe": False, "assinatura": False}
+
+            text_body, html_body = _group_body(
+                invs[0].customer_name,
+                base_date,
+                invs,
+                total,
+                missing,
+                agenda.get("extra_body"),
+                purchase_map=purchase_map,
+                attachment_flags=flags,
+            )
 
             msg = EmailMessage()
-            msg["From"] = smtp_email
+            msg["From"] = format_smtp_from(smtp_cfg) or smtp_email
             msg["To"] = to_email
             msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
             

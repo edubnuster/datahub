@@ -10,6 +10,7 @@ from .helpers import AppError
 
 class Database:
     _purchase_meta: Dict[str, Any] = {}
+    _table_columns_cache: Dict[str, set] = {}
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -35,14 +36,23 @@ class Database:
                 cur.execute("select 1")
                 cur.fetchone()
 
-    def list_inactive_customers(self) -> List[Dict[str, Any]]:
+    def list_inactive_customers(self, inactive_months: int = 3) -> List[Dict[str, Any]]:
         sql_text = (self.config.get("queries", {}).get("list_inactive_customers_sql") or "").strip()
         if not sql_text:
             raise AppError("A query de listagem de clientes inativos não está configurada.")
 
+        try:
+            inactive_months = int(inactive_months or 0)
+        except Exception:
+            inactive_months = 0
+        inactive_months = max(1, min(2400, inactive_months))
+
         with self._connect() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql_text)
+                if "%(inactive_months)" in sql_text:
+                    cur.execute(sql_text, {"inactive_months": inactive_months})
+                else:
+                    cur.execute(sql_text)
                 return [dict(r) for r in cur.fetchall()]
 
     def _escaped_open_invoices_sql(self) -> str:
@@ -170,8 +180,366 @@ class Database:
                 cur.execute(sql)
                 return [dict(r) for r in cur.fetchall()]
 
+    @staticmethod
+    def _normalize_bigint_ids(ids: List[Any]) -> List[int]:
+        out: List[int] = []
+        for i in (ids or []):
+            if i in (None, "", 0, "0"):
+                continue
+            if isinstance(i, bool):
+                continue
+            if isinstance(i, int):
+                out.append(i)
+                continue
+            try:
+                s = str(i).strip()
+            except Exception:
+                continue
+            if not s:
+                continue
+            if s.isdigit():
+                try:
+                    out.append(int(s))
+                except Exception:
+                    continue
+        return out
+
+    @classmethod
+    def _get_table_columns(cls, conn, table_name: str, *, schema: str = "public") -> set:
+        key = f"{schema.lower().strip()}.{str(table_name or '').lower().strip()}"
+        cached = cls._table_columns_cache.get(key)
+        if cached is not None:
+            return cached
+        cols: set = set()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select column_name
+                    from information_schema.columns
+                    where table_schema = %s
+                      and table_name = %s
+                    """,
+                    (schema, str(table_name or "").strip()),
+                )
+                for (cname,) in (cur.fetchall() or []):
+                    if cname:
+                        cols.add(str(cname).strip().lower())
+        except Exception:
+            cols = set()
+        cls._table_columns_cache[key] = cols
+        return cols
+
+    @staticmethod
+    def _pick_existing_column(cols: set, candidates: List[str]) -> str:
+        for c in (candidates or []):
+            cc = str(c or "").strip().lower()
+            if cc and cc in cols:
+                return cc
+        return ""
+
+    @staticmethod
+    def _maybe_decode_wrapped_bytes(data: bytes) -> bytes:
+        if not data:
+            return data
+        if data.startswith(b"%PDF-") or data.startswith(b"\x89PNG\r\n\x1a\n") or data[:3] == b"\xff\xd8\xff":
+            return data
+        if data.lstrip().startswith(b"<"):
+            return data
+
+        try:
+            s = data.decode("ascii", errors="strict").strip()
+        except Exception:
+            return data
+
+        if s.startswith("\\x") and len(s) > 2:
+            hex_part = s[2:].strip()
+            if hex_part and all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                try:
+                    decoded = bytes.fromhex(hex_part)
+                    if decoded:
+                        return decoded
+                except Exception:
+                    return data
+
+        if len(s) >= 16 and all(c.isalnum() or c in "+/=\r\n-_" for c in s):
+            compact = "".join(s.split())
+            if compact:
+                pad = (-len(compact)) % 4
+                compact_padded = compact + ("=" * pad)
+                decoded = b""
+                try:
+                    decoded = base64.b64decode(compact_padded, validate=True)
+                except Exception:
+                    try:
+                        decoded = base64.b64decode(compact_padded, validate=False)
+                    except Exception:
+                        decoded = b""
+                if decoded and (
+                    decoded.startswith(b"%PDF-")
+                    or decoded.startswith(b"\x89PNG\r\n\x1a\n")
+                    or decoded[:3] == b"\xff\xd8\xff"
+                    or decoded.lstrip().startswith(b"<")
+                ):
+                    return decoded
+
+        return data
+
+    @classmethod
+    def _blob_to_bytes(cls, raw: Any) -> Optional[bytes]:
+        if raw is None:
+            return None
+        data: Optional[bytes] = None
+        if isinstance(raw, memoryview):
+            data = raw.tobytes()
+        elif isinstance(raw, (bytes, bytearray)):
+            data = bytes(raw)
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                data = None
+            elif s.lstrip().startswith("<"):
+                data = s.encode("utf-8", errors="replace")
+            else:
+                compact = "".join(s.split())
+                pad = (-len(compact)) % 4
+                compact_padded = compact + ("=" * pad)
+                decoded = b""
+                try:
+                    decoded = base64.b64decode(compact_padded, validate=True)
+                except Exception:
+                    try:
+                        decoded = base64.b64decode(compact_padded, validate=False)
+                    except Exception:
+                        decoded = b""
+                if decoded and (decoded.startswith(b"%PDF-") or decoded.lstrip().startswith(b"<")):
+                    data = decoded
+                else:
+                    data = s.encode("utf-8", errors="replace")
+        if not data:
+            return None
+        return cls._maybe_decode_wrapped_bytes(data)
+
+    def check_boleto_exists_bulk(self, movto_ids: List[Any]) -> Dict[Any, bool]:
+        movto_ids_sql = self._normalize_bigint_ids(movto_ids)
+        if not movto_ids_sql:
+            return {}
+
+        sql = """
+            select distinct b.movto as movto_id
+            from boleto b
+            where b.movto = any(%(movto_ids)s::bigint[])
+              and (b.situacao is null or b.situacao < 5)
+        """
+        found: set = set()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"movto_ids": movto_ids_sql})
+                for (movto_id,) in (cur.fetchall() or []):
+                    if movto_id not in (None, "", 0, "0"):
+                        found.add(int(movto_id))
+
+        out: Dict[Any, bool] = {}
+        for movto_id in movto_ids_sql:
+            exists = int(movto_id) in found
+            out[int(movto_id)] = exists
+            out[str(int(movto_id))] = exists
+        return out
+
+    def check_nota_fiscal_exists_bulk(self, invoice_ids: List[Any]) -> Dict[Any, bool]:
+        invoice_ids_sql = self._normalize_bigint_ids(invoice_ids)
+        if not invoice_ids_sql:
+            return {}
+
+        sql = """
+            select distinct inv.grid as invoice_id
+            from movto inv
+            left join movto_map mp
+              on mp.child = inv.grid
+            left join movto s
+              on s.grid = mp.parent
+            join nota_fiscal nf
+              on nf.mlid = coalesce(nullif(inv.mlid, 0), nullif(s.mlid, 0))
+            where inv.grid = any(%(invoice_ids)s::bigint[])
+              and coalesce(nullif(inv.mlid, 0), nullif(s.mlid, 0)) is not null
+        """
+
+        found: set = set()
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"invoice_ids": invoice_ids_sql})
+                for (invoice_id,) in (cur.fetchall() or []):
+                    if invoice_id not in (None, "", 0, "0"):
+                        found.add(int(invoice_id))
+
+        out: Dict[Any, bool] = {}
+        for invoice_id in invoice_ids_sql:
+            exists = int(invoice_id) in found
+            out[int(invoice_id)] = exists
+            out[str(int(invoice_id))] = exists
+        return out
+
+    def get_nfe_attachments_bulk(self, invoice_ids: List[Any]) -> Dict[Any, Dict[str, Any]]:
+        invoice_ids_sql = self._normalize_bigint_ids(invoice_ids)
+        if not invoice_ids_sql:
+            return {}
+
+        out: Dict[Any, Dict[str, Any]] = {}
+        for invoice_id in invoice_ids_sql:
+            out[int(invoice_id)] = {"exists": False, "attachments": []}
+            out[str(int(invoice_id))] = out[int(invoice_id)]
+
+        with self._connect() as conn:
+            nfe_xml_cols = self._get_table_columns(conn, "nfe_xml", schema="public")
+            if not nfe_xml_cols:
+                return out
+            nf_cols = self._get_table_columns(conn, "nota_fiscal", schema="public")
+            nfe_cols = self._get_table_columns(conn, "nfe", schema="public")
+            xml_col = self._pick_existing_column(
+                nfe_xml_cols,
+                [
+                    "xml",
+                    "xml_nfe",
+                    "nfe_xml",
+                    "fonte_xml",
+                    "arquivo_xml",
+                    "conteudo_xml",
+                    "conteudo",
+                    "arquivo",
+                ],
+            )
+            danfe_col = self._pick_existing_column(
+                nfe_xml_cols,
+                [
+                    "danfe_pdf",
+                    "arquivo_pdf",
+                    "pdf",
+                    "danfe",
+                    "danfe_arquivo",
+                    "danfe_bytes",
+                ],
+            )
+
+            xml_expr = f"x.{xml_col} as xml_raw" if xml_col else "NULL as xml_raw"
+            danfe_expr = f"x.{danfe_col} as danfe_raw" if danfe_col else "NULL as danfe_raw"
+
+            nf_num_col = self._pick_existing_column(nf_cols, ["numero", "num", "nr", "nro"])
+            nf_serie_col = self._pick_existing_column(nf_cols, ["serie", "ser"])
+            nf_chave_col = self._pick_existing_column(nf_cols, ["chave", "chave_nfe", "chave_acesso", "chave_acesso_nfe"])
+            nfe_chave_col = self._pick_existing_column(nfe_cols, ["chave_acesso", "chave", "chave_nfe", "chave_acesso_nfe"]) if nfe_cols else ""
+            nf_num_expr = f"nf.{nf_num_col} as nf_numero" if nf_num_col else "NULL as nf_numero"
+            nf_serie_expr = f"nf.{nf_serie_col} as nf_serie" if nf_serie_col else "NULL as nf_serie"
+            nf_chave_expr = f"nf.{nf_chave_col} as nf_chave" if nf_chave_col else "NULL as nf_chave"
+
+            nfe_xml_fk_nf = self._pick_existing_column(nfe_xml_cols, ["nota_fiscal", "nota_fiscal_id"])
+            nfe_xml_fk_nfe = self._pick_existing_column(nfe_xml_cols, ["nfe", "nfe_id"])
+            nfe_fk_nf = self._pick_existing_column(nfe_cols, ["nota_fiscal", "nota_fiscal_id"]) if nfe_cols else ""
+
+            join_sql = ""
+            if nfe_xml_fk_nf:
+                join_sql = f"left join nfe_xml x on x.{nfe_xml_fk_nf} = nf.grid"
+            elif nfe_xml_fk_nfe and nfe_fk_nf:
+                join_sql = f"""
+                    left join nfe n
+                      on n.{nfe_fk_nf} = nf.grid
+                    left join nfe_xml x
+                      on x.{nfe_xml_fk_nfe} = n.grid
+                """
+                if not nf_chave_col and nfe_chave_col:
+                    nf_chave_expr = f"n.{nfe_chave_col} as nf_chave"
+            else:
+                join_sql = "left join nfe_xml x on 1=0"
+
+            sql = f"""
+                select
+                    l.invoice_id,
+                    nf.grid as nota_fiscal_id,
+                    {nf_num_expr},
+                    {nf_serie_expr},
+                    {nf_chave_expr},
+                    {xml_expr},
+                    {danfe_expr}
+                from (
+                    select
+                        inv.grid as invoice_id,
+                        coalesce(nullif(inv.mlid, 0), nullif(s.mlid, 0)) as mlid
+                    from movto inv
+                    left join movto_map mp
+                      on mp.child = inv.grid
+                    left join movto s
+                      on s.grid = mp.parent
+                    where inv.grid = any(%(invoice_ids)s::bigint[])
+                ) l
+                join nota_fiscal nf
+                  on nf.mlid = l.mlid
+                {join_sql}
+                order by l.invoice_id, nf.grid desc
+            """
+
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, {"invoice_ids": invoice_ids_sql})
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+
+        seen_nf: Dict[int, set] = {}
+        for r in rows:
+            inv_id = r.get("invoice_id")
+            if inv_id in (None, "", 0, "0"):
+                continue
+            try:
+                inv_id_i = int(inv_id)
+            except Exception:
+                continue
+
+            nf_id = r.get("nota_fiscal_id")
+            try:
+                nf_id_i = int(nf_id)
+            except Exception:
+                nf_id_i = 0
+
+            if inv_id_i not in seen_nf:
+                seen_nf[inv_id_i] = set()
+            if nf_id_i and nf_id_i in seen_nf[inv_id_i]:
+                continue
+            if nf_id_i:
+                seen_nf[inv_id_i].add(nf_id_i)
+
+            out[inv_id_i]["exists"] = True
+            out[str(inv_id_i)] = out[inv_id_i]
+
+            nf_num = str(r.get("nf_numero") or "").strip()
+            nf_serie = str(r.get("nf_serie") or "").strip()
+            nf_chave = str(r.get("nf_chave") or "").strip()
+
+            name_parts = []
+            if nf_num:
+                name_parts.append(nf_num)
+            if nf_serie:
+                name_parts.append(f"serie{nf_serie}")
+            if not name_parts and nf_chave:
+                name_parts.append(nf_chave[-12:])
+            if not name_parts and nf_id_i:
+                name_parts.append(str(nf_id_i))
+            suffix = "_".join(name_parts) if name_parts else str(inv_id_i)
+
+            xml_bytes = self._blob_to_bytes(r.get("xml_raw"))
+            if xml_bytes and xml_bytes.strip():
+                out[inv_id_i]["attachments"].append({"data": xml_bytes, "filename": f"nfe_{suffix}.xml", "mime_type": "application/xml"})
+                out[str(inv_id_i)] = out[inv_id_i]
+
+            danfe_bytes = self._blob_to_bytes(r.get("danfe_raw"))
+            if danfe_bytes and danfe_bytes.strip():
+                out[inv_id_i]["attachments"].append({"data": danfe_bytes, "filename": f"danfe_{suffix}.pdf", "mime_type": "application/pdf"})
+                out[str(inv_id_i)] = out[inv_id_i]
+
+        return out
+
 
     def get_boleto_email_payload(self, invoice_id) -> Dict[str, Any]:
+        try:
+            invoice_id_val = int(invoice_id)
+        except (ValueError, TypeError):
+            invoice_id_val = invoice_id
+
         sql = """
             select
                 b.grid as boleto_grid,
@@ -221,7 +589,7 @@ class Database:
         ob = None
         with self._connect() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, (invoice_id,))
+                cur.execute(sql, (invoice_id_val,))
                 row = cur.fetchone()
                 if row:
                     open_banking_sql = """
@@ -270,7 +638,16 @@ class Database:
                 email_note = f"Observação: houve falha na geração automática do boleto: {ob.get('erro')}"
 
         if not email_note:
-            email_note = "Observação: o boleto foi localizado e será gerado em PDF pelo app para envio em anexo."
+            email_note = "Observação: anexo boleto da fatura."
+
+        try:
+            sig = self.get_sale_signature_pdf(invoice_id)
+            has_signature = (sig or {}).get("exists") or bool((sig or {}).get("attachments"))
+        except Exception:
+            has_signature = False
+
+        if email_note in ("Observação: anexo boleto da fatura.", "Observação: o boleto segue em anexo.") and has_signature:
+            email_note = "Observação: Anexo boleto e cupom assinado."
 
         vencto = data.get("vencto")
         data["vencto_display"] = vencto.strftime("%d/%m/%Y") if hasattr(vencto, "strftime") else str(vencto or "")
@@ -427,7 +804,7 @@ class Database:
                     email_note = f"Boleto: houve falha na geração automática: {ob.get('erro')}"
 
             if not email_note:
-                email_note = "Boleto: localizado e será gerado em PDF para envio."
+                email_note = "Boleto: localizado."
 
             vencto = data.get("vencto")
             data["vencto_display"] = vencto.strftime("%d/%m/%Y") if hasattr(vencto, "strftime") else str(vencto or "")
@@ -444,6 +821,115 @@ class Database:
             out[str(inv_id)] = data
 
         return out
+
+    def list_generated_boletos(self, window_start: datetime, window_end: datetime) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT 
+                b.grid as boleto_grid,
+                m.grid as movto_id,
+                m.pessoa as customer_id,
+                pessoa_nome_f(m.pessoa) as cliente,
+                COALESCE(c.email, '') as customer_email,
+                bi.documento,
+                (bi.data_geracao::timestamp) as generated_at,
+                bi.valor as valor
+            FROM boleto b
+            JOIN movto m ON m.grid = b.movto
+            LEFT JOIN cliente c ON c.grid = m.pessoa
+            LEFT JOIN boleto_info bi ON bi.grid = b.boleto_info
+            WHERE (bi.data_geracao::timestamp) >= %s AND (bi.data_geracao::timestamp) <= %s
+              AND (b.situacao IS NULL OR b.situacao < 5)
+            ORDER BY (bi.data_geracao::timestamp) ASC
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (window_start, window_end))
+                return [dict(r) for r in cur.fetchall()]
+
+    def list_boletos_by_grids(self, boleto_grids: List[Any], *, include_closed: bool = False) -> List[Dict[str, Any]]:
+        boleto_grids = [b for b in (boleto_grids or []) if b not in (None, "", 0, "0")]
+        bg_sql: List[int] = []
+        for b in boleto_grids:
+            if isinstance(b, bool):
+                continue
+            if isinstance(b, int):
+                bg_sql.append(b)
+                continue
+            s = str(b).strip()
+            if s.isdigit():
+                try:
+                    bg_sql.append(int(s))
+                except Exception:
+                    pass
+        if not bg_sql:
+            return []
+
+        saldo_filter = "" if include_closed else " AND (t.valor - t.valor_desconto - t.valor_baixado) > 0"
+        sql = f"""
+            WITH titulos AS (
+                SELECT
+                    b.grid AS boleto_grid,
+                    b.movto AS movto_id,
+                    pessoa_nome_f(m.empresa) AS empresa,
+                    m.pessoa AS customer_id,
+                    p.codigo AS codigo_cliente,
+                    p.nome AS cliente,
+                    m.conta_debitar AS conta,
+                    conta_nome_f(m.conta_debitar) AS conta_nome,
+                    m.data AS data,
+                    m.valor AS valor,
+                    COALESCE((
+                        SELECT SUM(fl.valor_desconto)
+                        FROM fatura_lancto fl
+                        WHERE fl.movto = m.grid
+                    ), 0) AS valor_desconto,
+                    COALESCE((
+                        SELECT SUM(d.valor)
+                        FROM movto_map mp
+                        JOIN movto d ON d.grid = mp.child
+                        WHERE mp.parent = m.grid
+                          AND d.motivo = 155
+                    ), 0) AS valor_baixado,
+                    b.boleto_info AS boleto_info_id
+                FROM boleto b
+                JOIN movto m
+                  ON m.grid = b.movto
+                JOIN pessoa p
+                  ON p.grid = m.pessoa
+                WHERE b.grid = ANY(%s)
+            )
+            SELECT
+                t.movto_id,
+                t.empresa,
+                t.customer_id,
+                t.codigo_cliente,
+                t.cliente,
+                t.conta,
+                t.conta_nome,
+                t.data,
+                bi.vencto AS vencto,
+                t.valor,
+                t.valor_desconto,
+                t.valor_baixado,
+                (t.valor - t.valor_desconto - t.valor_baixado) AS saldo_em_aberto,
+                COALESCE(c.email, '') AS customer_email,
+                bi.documento AS documento,
+                t.boleto_grid
+            FROM titulos t
+            JOIN pessoa pcli
+              ON pcli.grid = t.customer_id
+            LEFT JOIN cliente c
+              ON c.grid = t.customer_id
+            LEFT JOIN boleto_info bi
+              ON bi.grid = t.boleto_info_id
+            WHERE coalesce(pcli.tipo, pcli.tipo_pessoa::text, '') ILIKE '%%C%%'
+            {saldo_filter}
+            ORDER BY t.empresa, t.cliente, bi.vencto, t.boleto_grid
+        """
+        with self._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (bg_sql,))
+                return [dict(r) for r in cur.fetchall()]
 
     def get_boletos_email_payload_by_boleto_grids(self, boleto_grids: List[Any]) -> Dict[Any, Dict[str, Any]]:
         boleto_grids = [b for b in (boleto_grids or []) if b not in (None, "", 0, "0")]
@@ -558,7 +1044,7 @@ class Database:
                         elif ob.get("erro"):
                             email_note = f"Boleto: houve falha na geração automática: {ob.get('erro')}"
                     if not email_note:
-                        email_note = "Boleto: localizado e será gerado em PDF para envio."
+                        email_note = "Boleto: localizado."
                     vencto = data.get("vencto")
                     data["vencto_display"] = vencto.strftime("%d/%m/%Y") if hasattr(vencto, "strftime") else str(vencto or "")
                     data["valor_display"] = self._money_display(data.get("valor"))
@@ -728,78 +1214,58 @@ class Database:
             meta = {"has_hora": has_hora, "has_produto_nome_f": has_produto_nome_f}
             self.__class__._purchase_meta = meta
 
-        dt_expr = "m.hora" if meta.get("has_hora") else "m.data"
+        dt_expr = "inv.hora" if meta.get("has_hora") else "inv.data"
         sale_dt_expr = "s.hora" if meta.get("has_hora") else "s.data"
         prod_expr = "produto_nome_f(l.produto)" if meta.get("has_produto_nome_f") else "l.produto::text"
 
         sql = f"""
-            with inv as (
-                select
-                    m.grid as invoice_id,
-                    m.valor as invoice_amount,
-                    m.documento as invoice_documento,
-                    {dt_expr} as invoice_dt,
-                    m.mlid as invoice_mlid
-                from movto m
-                where m.grid = any(%s)
-            ),
-            sales as (
-                select
-                    inv.invoice_id,
-                    inv.invoice_amount,
-                    inv.invoice_documento as documento,
-                    inv.invoice_dt as dt,
-                    inv.invoice_mlid as mlid
-                from inv
-                union all
-                select
-                    inv.invoice_id,
-                    inv.invoice_amount,
-                    s.documento as documento,
-                    {sale_dt_expr} as dt,
-                    s.mlid as mlid
-                from inv
-                join movto_map mm
-                  on mm.child = inv.invoice_id
-                join movto s
-                  on s.grid = mm.parent
-            ),
-            items as (
-                select
-                    sales.invoice_id,
-                    sales.invoice_amount,
-                    sales.documento,
-                    sales.dt,
-                    nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
-                    sum(coalesce(l.quantidade, 0)) as quantity,
-                    sum(coalesce(l.valor, 0)) as item_total
-                from sales
-                join lancto l
-                  on l.mlid = sales.mlid
-                where l.operacao = 'V'
-                group by
-                    sales.invoice_id,
-                    sales.invoice_amount,
-                    sales.documento,
-                    sales.dt,
-                    product_name
-            )
             select
-                invoice_id,
-                invoice_amount,
-                documento,
-                dt,
-                product_name,
-                quantity,
-                item_total
-            from items
+                inv.grid as invoice_id,
+                inv.valor as invoice_amount,
+                inv.documento as documento,
+                {dt_expr} as dt,
+                nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
+                sum(coalesce(l.quantidade, 0)) as quantity,
+                sum(coalesce(l.valor, 0)) as item_total
+            from movto inv
+            join lancto l
+              on l.mlid = inv.mlid
+            where inv.grid = any(%s)
+              and l.operacao = 'V'
+            group by inv.grid, inv.valor, inv.documento, {dt_expr}, product_name
+
+            union all
+
+            select
+                inv.grid as invoice_id,
+                inv.valor as invoice_amount,
+                s.documento as documento,
+                {sale_dt_expr} as dt,
+                nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
+                sum(coalesce(l.quantidade, 0)) as quantity,
+                sum(coalesce(l.valor, 0)) as item_total
+            from movto_map mm
+            join movto inv
+              on inv.grid = mm.child
+            join movto s
+              on s.grid = mm.parent
+            join lancto l
+              on l.mlid = s.mlid
+            where mm.child = any(%s)
+              and mm.parent is not null
+              and mm.child is not null
+              and mm.parent <> 0
+              and mm.child <> 0
+              and l.operacao = 'V'
+            group by inv.grid, inv.valor, s.documento, {sale_dt_expr}, product_name
+
             order by invoice_id, dt, documento, product_name
         """
 
         out: Dict[Any, Dict[str, Any]] = {}
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (invoice_ids_sql,))
+                cur.execute(sql, (invoice_ids_sql, invoice_ids_sql))
                 rows = cur.fetchall() or []
 
         tmp: Dict[int, Dict[str, Any]] = {}
@@ -914,55 +1380,37 @@ class Database:
             return {}
 
         sql = """
-            WITH inv AS (
-                SELECT unnest(%(movto_ids)s::bigint[]) AS invoice_id
-            ),
-            parents AS (
-                SELECT
-                    mm.child AS invoice_id,
-                    mm.parent AS sale_id
-                FROM movto_map mm
-                JOIN inv ON inv.invoice_id = mm.child
-                WHERE mm.parent IS NOT NULL
-                  AND mm.child IS NOT NULL
-                  AND mm.parent <> 0
-                  AND mm.child <> 0
-            ),
-            candidates AS (
-                SELECT
-                    inv.invoice_id,
-                    a.grid AS anexo_grid,
-                    a.descricao,
-                    a.extensao,
-                    a.anexo,
-                    a.ts
-                FROM public.anexo a
-                JOIN inv ON inv.invoice_id = a.movto
-                WHERE lower(coalesce(a.descricao, '')) LIKE '%%assinatura%%'
+            select
+                a.movto as movto_id,
+                a.grid as grid,
+                a.descricao,
+                a.extensao,
+                a.anexo,
+                a.ts
+            from public.anexo a
+            where a.movto = any(%(movto_ids)s::bigint[])
+              and lower(coalesce(a.descricao, '')) like '%%assinatura%%'
 
-                UNION ALL
+            union all
 
-                SELECT
-                    p.invoice_id,
-                    a.grid AS anexo_grid,
-                    a.descricao,
-                    a.extensao,
-                    a.anexo,
-                    a.ts
-                FROM parents p
-                JOIN public.anexo a
-                  ON a.movto = p.sale_id
-                WHERE lower(coalesce(a.descricao, '')) LIKE '%%assinatura%%'
-            )
-            SELECT
-                c.invoice_id AS movto_id,
-                c.anexo_grid AS grid,
-                c.descricao,
-                c.extensao,
-                c.anexo,
-                c.ts
-            FROM candidates c
-            ORDER BY c.invoice_id, c.ts DESC NULLS LAST, c.anexo_grid DESC
+            select
+                mm.child as movto_id,
+                a.grid as grid,
+                a.descricao,
+                a.extensao,
+                a.anexo,
+                a.ts
+            from movto_map mm
+            join public.anexo a
+              on a.movto = mm.parent
+            where mm.child = any(%(movto_ids)s::bigint[])
+              and mm.parent is not null
+              and mm.child is not null
+              and mm.parent <> 0
+              and mm.child <> 0
+              and lower(coalesce(a.descricao, '')) like '%%assinatura%%'
+
+            order by movto_id, ts desc nulls last, grid desc
         """
 
         with self._connect() as conn:

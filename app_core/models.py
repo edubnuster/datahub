@@ -45,6 +45,9 @@ class InvoiceRow:
     customer_id: Any
     customer_code: Any
     customer_name: str
+    has_signed_doc: bool = False
+    has_boleto: bool = False
+    has_nota_fiscal: bool = False
     motive_code: Any = ""
     motive_name: str = ""
     account_code: str = ""

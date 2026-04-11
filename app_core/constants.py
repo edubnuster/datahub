@@ -43,7 +43,7 @@ LEFT JOIN pessoa_conta pc
   ON pc.pessoa = c.grid
 LEFT JOIN conta co
   ON co.codigo = pc.conta
-WHERE lp.last_purchase_date < current_date - interval '3 months'
+WHERE lp.last_purchase_date < current_date - (interval '1 month' * %(inactive_months)s)
 GROUP BY
     c.grid,
     lp.last_company_id,
@@ -122,9 +122,11 @@ DEFAULT_CONFIG = {
     },
     "smtp": {
         "email": "app@databrev.com.br",
+        "sender_name": "",
         "host": "smtp.zoho.com",
-        "password": "6UBwERuJiqJi",
-        "port": 465
+        "password": "",
+        "port": 465,
+        "delay_seconds": 5,
     },
     "financeiro_agendas": [],
     "queries": {
