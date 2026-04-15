@@ -46,6 +46,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
         return "application", "pdf"
     if ext == "xml":
         return "application", "xml"
+    if ext == "txt":
+        return "text", "plain"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -230,6 +232,10 @@ def run_agenda(
         days_after = 0
     days_before = max(0, min(365, days_before))
     days_after = max(0, min(365, days_after))
+    if days_after > 0:
+        days_before = 0
+    elif days_before > 0:
+        days_after = 0
     try:
         late_minutes = int((now - datetime.combine(now.date(), _parse_time(agenda.get("send_time")))).total_seconds() // 60)
         if late_minutes < 0:
@@ -390,14 +396,28 @@ def run_agenda(
 
         subject = _subject_group(invs[0].customer_name)
 
+        fatura_txt: Optional[Tuple[bytes, str]] = None
+        try:
+            from ui import build_faturas_detalhamento_txt_bytes
+
+            txt_bytes, txt_name = build_faturas_detalhamento_txt_bytes(invs, purchase_info_map=purchase_map)
+            if txt_bytes and txt_name:
+                fatura_txt = (txt_bytes, txt_name)
+        except Exception:
+            fatura_txt = None
+
         max_attachments = 18
         max_bytes = 15 * 1024 * 1024
+        reserved_count = 1 if fatura_txt else 0
+        reserved_bytes = len(fatura_txt[0]) if fatura_txt else 0
+        usable_max_attachments = max(1, max_attachments - reserved_count)
+        usable_max_bytes = max(1024, max_bytes - reserved_bytes)
         batches: List[List[Tuple[bytes, str]]] = []
         current: List[Tuple[bytes, str]] = []
         current_bytes = 0
         for data, name in attachments:
             size = len(data) if data else 0
-            if current and (len(current) >= max_attachments or (current_bytes + size) > max_bytes):
+            if current and (len(current) >= usable_max_attachments or (current_bytes + size) > usable_max_bytes):
                 batches.append(current)
                 current = []
                 current_bytes = 0
@@ -413,9 +433,12 @@ def run_agenda(
             try:
                 from ui import _detect_email_attachment_flags
 
-                flags = _detect_email_attachment_flags([name for data, name in batch if data])
+                flag_names = [name for data, name in batch if data]
+                if fatura_txt:
+                    flag_names.append(fatura_txt[1])
+                flags = _detect_email_attachment_flags(flag_names)
             except Exception:
-                flags = {"boleto": False, "fatura_pdf": False, "xml": False, "danfe": False, "assinatura": False}
+                flags = {"boleto": False, "fatura_pdf": False, "fatura_txt": False, "xml": False, "danfe": False, "assinatura": False}
 
             text_body, html_body = _group_body(
                 invs[0].customer_name,
@@ -435,6 +458,10 @@ def run_agenda(
             
             msg.set_content(text_body)
             msg.add_alternative(html_body, subtype='html')
+
+            if fatura_txt:
+                maintype, subtype = _mime_parts_from_filename(fatura_txt[1])
+                msg.add_attachment(fatura_txt[0], maintype=maintype, subtype=subtype, filename=fatura_txt[1])
             
             for data, name in batch:
                 if not data:
@@ -444,7 +471,7 @@ def run_agenda(
             try:
                 _smtp_send_message(cfg, msg)
                 emails_sent += 1
-                AuditLogger.write(user_label, "agenda_envio_email_cli", f"agenda_id={agenda_id};cliente={invs[0].customer_name};para={to_email};titulos={len(invs)};anexos={len(batch)};pix_incluido_no_boleto={'sim' if include_pix_qrcode else 'nao'}")
+                AuditLogger.write(user_label, "agenda_envio_email_cli", f"agenda_id={agenda_id};cliente={invs[0].customer_name};para={to_email};titulos={len(invs)};anexos={len(batch) + (1 if fatura_txt else 0)};pix_incluido_no_boleto={'sim' if include_pix_qrcode else 'nao'}")
             except Exception as e:
                 failed += 1
                 AuditLogger.write(user_label, "agenda_envio_email_cli_erro", f"agenda_id={agenda_id};cliente={invs[0].customer_name};para={to_email};erro={e}")

@@ -395,6 +395,7 @@ class Database:
                 return out
             nf_cols = self._get_table_columns(conn, "nota_fiscal", schema="public")
             nfe_cols = self._get_table_columns(conn, "nfe", schema="public")
+            nfs_cols = self._get_table_columns(conn, "nota_fiscal_situacao", schema="public")
             xml_col = self._pick_existing_column(
                 nfe_xml_cols,
                 [
@@ -450,6 +451,13 @@ class Database:
             else:
                 join_sql = "left join nfe_xml x on 1=0"
 
+            nfs_join_sql = ""
+            if nfs_cols:
+                nfs_nf_fk = self._pick_existing_column(nfs_cols, ["nota_fiscal", "nota_fiscal_id"])
+                nfs_situacao_col = self._pick_existing_column(nfs_cols, ["situacao", "tipo_situacao", "codigo_situacao", "status"])
+                if nfs_nf_fk and nfs_situacao_col:
+                    nfs_join_sql = f"join nota_fiscal_situacao nfs on nfs.{nfs_nf_fk} = nf.grid and nfs.{nfs_situacao_col} = 310"
+
             sql = f"""
                 select
                     l.invoice_id,
@@ -472,6 +480,7 @@ class Database:
                 ) l
                 join nota_fiscal nf
                   on nf.mlid = l.mlid
+                {nfs_join_sql}
                 {join_sql}
                 order by l.invoice_id, nf.grid desc
             """
@@ -515,6 +524,8 @@ class Database:
                 name_parts.append(nf_num)
             if nf_serie:
                 name_parts.append(f"serie{nf_serie}")
+            if nf_id_i and name_parts and len(name_parts) == 1 and name_parts[0].startswith("serie"):
+                name_parts.append(str(nf_id_i))
             if not name_parts and nf_chave:
                 name_parts.append(nf_chave[-12:])
             if not name_parts and nf_id_i:

@@ -103,6 +103,10 @@ class ConfigManager:
                     agenda["days_after_due"] = max(0, min(365, int(agenda.get("days_after_due", 0) or 0)))
                 except Exception:
                     agenda["days_after_due"] = 0
+                if agenda.get("days_after_due", 0) > 0:
+                    agenda["days_before_due"] = 0
+                elif agenda.get("days_before_due", 0) > 0:
+                    agenda["days_after_due"] = 0
                 agenda["group_id"] = agenda.get("group_id")
                 agenda["portador_id"] = agenda.get("portador_id")
                 agenda["customer_id"] = agenda.get("customer_id")

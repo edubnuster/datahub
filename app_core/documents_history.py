@@ -251,7 +251,7 @@ class DocumentsHistory:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT boleto_grid, movto_id, customer_id, customer_email, documento, generated_at, status, last_attempt_at, sent_at, error
+                SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
                   FROM documents
                  WHERE status IN ('pending','failed')
                     OR (status='no_email' AND (last_attempt_at='' OR last_attempt_at < ?))
@@ -268,12 +268,13 @@ class DocumentsHistory:
                     movto_id=str(r[1] or ""),
                     customer_id=str(r[2] or ""),
                     customer_email=str(r[3] or ""),
-                    documento=str(r[4] or ""),
-                    generated_at=str(r[5] or ""),
-                    status=str(r[6] or ""),
-                    last_attempt_at=str(r[7] or ""),
-                    sent_at=str(r[8] or ""),
-                    error=str(r[9] or ""),
+                    customer_name=str(r[4] or ""),
+                    documento=str(r[5] or ""),
+                    generated_at=str(r[6] or ""),
+                    status=str(r[7] or ""),
+                    last_attempt_at=str(r[8] or ""),
+                    sent_at=str(r[9] or ""),
+                    error=str(r[10] or ""),
                 )
             )
         return out

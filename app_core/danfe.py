@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+import html
 import re
+import struct
 from typing import Any, Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
+import zlib
+
+from .constants import app_dir
 
 
 def _pdf_escape(text: str) -> str:
@@ -76,6 +81,159 @@ def _build_pdf_bytes(ops: List[str]) -> bytes:
     return bytes(pdf)
 
 
+def _build_pdf_bytes_with_xobjects(
+    ops: List[str],
+    *,
+    xobjects: Dict[str, int],
+    extra_objects: List[bytes],
+) -> bytes:
+    page_width = 595
+    page_height = 842
+    stream = ("\n".join(ops)).encode("latin-1", errors="replace")
+
+    xobj_entries = " ".join([f"/{name} {int(obj_id)} 0 R" for name, obj_id in (xobjects or {}).items()])
+    xobj_block = f" /XObject << {xobj_entries} >>" if xobj_entries else ""
+
+    objects: List[bytes] = []
+    objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    objects.append(
+        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >>{xobj_block} >> /Contents 4 0 R >>\nendobj\n".encode(
+            "latin-1"
+        )
+    )
+    objects.append(b"4 0 obj\n<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream\nendobj\n")
+    objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n")
+    objects.append(b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n")
+    objects.extend(extra_objects or [])
+
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects)+1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        pdf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF".encode("ascii"))
+    return bytes(pdf)
+
+
+def _parse_png(png_bytes: bytes) -> tuple[int, int, int, int, bytes]:
+    if not png_bytes or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("PNG inválido.")
+
+    i = 8
+    width = height = bit_depth = color_type = interlace = 0
+    idat = bytearray()
+    while i + 8 <= len(png_bytes):
+        length = struct.unpack(">I", png_bytes[i : i + 4])[0]
+        ctype = png_bytes[i + 4 : i + 8]
+        i += 8
+        data = png_bytes[i : i + length]
+        i += length + 4
+        if ctype == b"IHDR":
+            width, height, bit_depth, color_type, comp, filt, interlace = struct.unpack(">IIBBBBB", data[:13])
+            if comp != 0 or filt != 0:
+                raise ValueError("PNG não suportado (compressão/filtro).")
+        elif ctype == b"IDAT":
+            idat.extend(data)
+        elif ctype == b"IEND":
+            break
+
+    if width <= 0 or height <= 0 or not idat:
+        raise ValueError("PNG inválido (IHDR/IDAT ausentes).")
+    if interlace != 0:
+        raise ValueError("PNG interlaçado não suportado.")
+    return width, height, bit_depth, color_type, bytes(idat)
+
+
+def _paeth(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _unfilter_png(raw: bytes, *, width: int, height: int, bpp: int) -> bytes:
+    row_bytes = width * bpp
+    out = bytearray(height * row_bytes)
+    in_i = 0
+    prev = bytearray(row_bytes)
+    for row in range(height):
+        f = raw[in_i]
+        in_i += 1
+        scan = bytearray(raw[in_i : in_i + row_bytes])
+        in_i += row_bytes
+        if f == 0:
+            pass
+        elif f == 1:
+            for j in range(row_bytes):
+                left = scan[j - bpp] if j >= bpp else 0
+                scan[j] = (scan[j] + left) & 0xFF
+        elif f == 2:
+            for j in range(row_bytes):
+                up = prev[j]
+                scan[j] = (scan[j] + up) & 0xFF
+        elif f == 3:
+            for j in range(row_bytes):
+                left = scan[j - bpp] if j >= bpp else 0
+                up = prev[j]
+                scan[j] = (scan[j] + ((left + up) // 2)) & 0xFF
+        elif f == 4:
+            for j in range(row_bytes):
+                left = scan[j - bpp] if j >= bpp else 0
+                up = prev[j]
+                up_left = prev[j - bpp] if j >= bpp else 0
+                scan[j] = (scan[j] + _paeth(left, up, up_left)) & 0xFF
+        else:
+            raise ValueError("PNG não suportado (filtro desconhecido).")
+        start = row * row_bytes
+        out[start : start + row_bytes] = scan
+        prev = scan
+    return bytes(out)
+
+
+def _png_to_rgb_and_alpha(png_bytes: bytes) -> tuple[int, int, bytes, Optional[bytes]]:
+    w, h, bit_depth, color_type, idat = _parse_png(png_bytes)
+    if bit_depth != 8:
+        raise ValueError("PNG não suportado (bit depth).")
+    if color_type not in (2, 6):
+        raise ValueError("PNG não suportado (color type).")
+
+    raw = zlib.decompress(idat)
+    bpp = 3 if color_type == 2 else 4
+    expected = h * (1 + w * bpp)
+    if len(raw) < expected:
+        raise ValueError("PNG inválido (dados incompletos).")
+    pix = _unfilter_png(raw[:expected], width=w, height=h, bpp=bpp)
+
+    if color_type == 2:
+        return w, h, pix, None
+
+    rgb = bytearray(w * h * 3)
+    alpha = bytearray(w * h)
+    for i_px in range(w * h):
+        src = i_px * 4
+        dst = i_px * 3
+        rgb[dst : dst + 3] = pix[src : src + 3]
+        alpha[i_px] = pix[src + 3]
+    return w, h, bytes(rgb), bytes(alpha)
+
+
+def _pdf_stream_obj(num: int, dict_src: str, stream_data: bytes) -> bytes:
+    head = f"{int(num)} 0 obj\n<< {dict_src} /Length {len(stream_data)} >>\nstream\n".encode("latin-1")
+    return head + (stream_data or b"") + b"\nendstream\nendobj\n"
+
+
 def _sanitize_xml_text(value: str) -> str:
     s = str(value or "").strip()
     if not s:
@@ -97,7 +255,7 @@ def _xml_ns(tag: str) -> str:
 def _t(el: Optional[ET.Element]) -> str:
     if el is None:
         return ""
-    return str(el.text or "").strip()
+    return html.unescape(str(el.text or "").strip())
 
 
 def _dt_display(value: str) -> str:
@@ -277,7 +435,15 @@ def _extract_nfe_fields(xml_text: str) -> Dict[str, Any]:
     return out
 
 
-def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "") -> Tuple[Optional[bytes], str]:
+def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_logo_png_bytes: Optional[bytes] = None) -> Tuple[Optional[bytes], str]:
+    if emit_logo_png_bytes is None:
+        try:
+            p = app_dir() / "danfe_emitente_logo.png"
+            if p.is_file():
+                emit_logo_png_bytes = p.read_bytes()
+        except Exception:
+            emit_logo_png_bytes = None
+
     if xml_data is None:
         return None, ""
     if isinstance(xml_data, (bytes, bytearray)):
@@ -312,6 +478,10 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "") -> Tuple
     right = left + width
 
     ops: List[str] = []
+    extra_objects: List[bytes] = []
+    xobjects: Dict[str, int] = {}
+    logo_name = ""
+    logo_w = logo_h = 0
 
     def draw_text(x, y, text, size=9, bold=False, max_len=None, align="left"):
         text = str(text or "").strip()
@@ -360,6 +530,14 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "") -> Tuple
             return f"{c[:5]}-{c[5:]}"
         return c
 
+    def draw_xobject(name: str, x: float, y: float, w: float, h: float):
+        if not name:
+            return
+        ops.append("q")
+        ops.append(f"{w} 0 0 {h} {x} {y} cm")
+        ops.append(f"/{name} Do")
+        ops.append("Q")
+
     def draw_itf_barcode(x, y, w, h, data):
         digits = "".join([c for c in str(data or "") if c.isdigit()])
         if not digits:
@@ -405,13 +583,49 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "") -> Tuple
                 ops.append("f")
             cx += bw
 
+    if emit_logo_png_bytes:
+        try:
+            w, h, rgb, alpha = _png_to_rgb_and_alpha(emit_logo_png_bytes)
+            img_stream = zlib.compress(rgb)
+            smask_ref = ""
+            next_obj = 7
+            if alpha is not None:
+                mask_stream = zlib.compress(alpha)
+                extra_objects.append(
+                    _pdf_stream_obj(
+                        next_obj,
+                        f"/Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                        mask_stream,
+                    )
+                )
+                smask_ref = f" /SMask {next_obj} 0 R"
+                next_obj += 1
+            extra_objects.append(
+                _pdf_stream_obj(
+                    next_obj,
+                    f"/Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode{smask_ref}",
+                    img_stream,
+                )
+            )
+            logo_name = "LogoEmit"
+            xobjects[logo_name] = next_obj
+            logo_w, logo_h = w, h
+        except Exception:
+            extra_objects = []
+            xobjects = {}
+            logo_name = ""
+            logo_w = logo_h = 0
+
     # --- Canhoto ---
     canhoto_h = 40
     y = top - canhoto_h
     draw_rect(left, y, width - 100, canhoto_h)
     draw_rect(right - 100, y, 100, canhoto_h)
     draw_text(left + 2, y + canhoto_h - 6, "RECEBEMOS DE", size=5)
-    draw_text(left + 50, y + canhoto_h - 6, f"{fields.get('emit_xNome')} OS PRODUTOS E/OU SERVIÇOS CONSTANTES DA NOTA FISCAL INDICADA ABAIXO", size=5)
+    if logo_name:
+        draw_text(left + 50, y + canhoto_h - 6, "OS PRODUTOS E/OU SERVIÇOS CONSTANTES DA NOTA FISCAL INDICADA ABAIXO", size=5)
+    else:
+        draw_text(left + 50, y + canhoto_h - 6, f"{fields.get('emit_xNome')} OS PRODUTOS E/OU SERVIÇOS CONSTANTES DA NOTA FISCAL INDICADA ABAIXO", size=5)
     
     draw_line(left, y + canhoto_h - 12, left + width - 100, y + canhoto_h - 12)
     draw_line(left + 100, y, left + 100, y + canhoto_h - 12)
@@ -437,14 +651,31 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "") -> Tuple
     w_emit_left = 230
     draw_line(left + w_emit_left, y, left + w_emit_left, y + emit_h)
     draw_text(left + w_emit_left/2, y + emit_h - 8, "IDENTIFICAÇÃO DO EMITENTE", size=6, align="center")
-    draw_text(left + w_emit_left/2, y + emit_h - 25, fields.get('emit_xNome'), size=9, bold=True, align="center", max_len=45)
+    if logo_name and logo_w > 0 and logo_h > 0:
+        max_w = w_emit_left - 10
+        max_h = 30
+        scale = min(max_w / float(logo_w), max_h / float(logo_h))
+        dw = float(logo_w) * scale
+        dh = float(logo_h) * scale
+        x0 = left + (w_emit_left - dw) / 2
+        y_top = y + emit_h - 18
+        y0 = y_top - dh
+        draw_xobject(logo_name, x0, y0, dw, dh)
+        addr_y1 = y + emit_h - 55
+        addr_y2 = y + emit_h - 65
+        addr_y3 = y + emit_h - 75
+    else:
+        draw_text(left + w_emit_left/2, y + emit_h - 25, fields.get('emit_xNome'), size=9, bold=True, align="center", max_len=45)
+        addr_y1 = y + emit_h - 40
+        addr_y2 = y + emit_h - 50
+        addr_y3 = y + emit_h - 60
     
     end_emit = f"{fields.get('emit_xLgr')}, {fields.get('emit_nro')}"
     if fields.get('emit_xCpl'):
         end_emit += f" - {fields.get('emit_xCpl')}"
-    draw_text(left + w_emit_left/2, y + emit_h - 40, end_emit, size=7, align="center", max_len=55)
-    draw_text(left + w_emit_left/2, y + emit_h - 50, f"{fields.get('emit_xBairro')} - CEP {format_cep(fields.get('emit_CEP'))}", size=7, align="center")
-    draw_text(left + w_emit_left/2, y + emit_h - 60, f"{fields.get('emit_xMun')} - {fields.get('emit_UF')} Fone: {fields.get('emit_fone') or ''}", size=7, align="center")
+    draw_text(left + w_emit_left/2, addr_y1, end_emit, size=7, align="center", max_len=55)
+    draw_text(left + w_emit_left/2, addr_y2, f"{fields.get('emit_xBairro')} - CEP {format_cep(fields.get('emit_CEP'))}", size=7, align="center")
+    draw_text(left + w_emit_left/2, addr_y3, f"{fields.get('emit_xMun')} - {fields.get('emit_UF')} Fone: {fields.get('emit_fone') or ''}", size=7, align="center")
 
     # Middle box (DANFE info)
     w_emit_mid = 85
@@ -753,4 +984,6 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "") -> Tuple
             draw_text(left + w_adic + 2, dy, line, size=6)
             dy -= 8
 
+    if xobjects and extra_objects:
+        return _build_pdf_bytes_with_xobjects(ops, xobjects=xobjects, extra_objects=extra_objects), filename
     return _build_pdf_bytes(ops), filename

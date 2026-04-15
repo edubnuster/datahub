@@ -5,6 +5,7 @@ import sys
 APP_TITLE = "DataHub"
 CONFIG_FILENAME = "config.json"
 AUDIT_FILENAME = "audit.log"
+LOG_FOLDERNAME = "log"
 LICENSE_FILENAME = "databrev.key"
 LICENSE_SECRET = "DATABREV-LICENSE-2026"
 
@@ -155,6 +156,9 @@ def app_dir() -> Path:
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
+def log_dir() -> Path:
+    return app_dir() / LOG_FOLDERNAME
+
 CONFIG_PATH = app_dir() / CONFIG_FILENAME
-AUDIT_PATH = app_dir() / AUDIT_FILENAME
+AUDIT_PATH = log_dir() / AUDIT_FILENAME
 LICENSE_PATH = app_dir() / LICENSE_FILENAME

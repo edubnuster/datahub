@@ -8,7 +8,7 @@ from email.message import EmailMessage
 import logging
 import smtplib
 import ssl
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .database import Database
 from .danfe import danfe_pdf_from_nfe_xml
@@ -35,6 +35,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
         return "application", "pdf"
     if ext == "xml":
         return "application", "xml"
+    if ext == "txt":
+        return "text", "plain"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -155,6 +157,56 @@ class _AutoDocsRunLock:
         return False
 
 
+def _effective_auto_docs_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    schedules = cfg.get("financeiro_envio_auto_documentos_agendamentos")
+    active_id = str(cfg.get("financeiro_envio_auto_documentos_active_id") or "").strip()
+    if isinstance(schedules, list):
+        if not schedules:
+            cfg["financeiro_envio_auto_documentos"] = {"enabled": False}
+            return cfg["financeiro_envio_auto_documentos"]
+        cleaned: List[Dict[str, Any]] = []
+        enabled: List[Dict[str, Any]] = []
+        for s in schedules:
+            if not isinstance(s, dict):
+                continue
+            sid = str(s.get("id") or "").strip()
+            if not sid:
+                continue
+            cleaned.append(s)
+            if bool(s.get("enabled")):
+                enabled.append(s)
+        if cleaned != schedules:
+            cfg["financeiro_envio_auto_documentos_agendamentos"] = cleaned
+            schedules = cleaned
+        if enabled:
+            active = None
+            for s in enabled:
+                if str(s.get("id") or "").strip() == active_id:
+                    active = s
+                    break
+            if active is None:
+                active = enabled[0]
+            keep_id = str(active.get("id") or "").strip()
+            if len(enabled) > 1 and keep_id:
+                for s in schedules:
+                    if not isinstance(s, dict):
+                        continue
+                    sid = str(s.get("id") or "").strip()
+                    if sid and sid != keep_id:
+                        s["enabled"] = False
+                cfg["financeiro_envio_auto_documentos_active_id"] = keep_id
+            cfg["financeiro_envio_auto_documentos"] = active
+            return active
+        if not active_id and schedules:
+            cfg["financeiro_envio_auto_documentos_active_id"] = str(schedules[0].get("id") or "").strip()
+
+    auto_cfg = cfg.get("financeiro_envio_auto_documentos")
+    if not isinstance(auto_cfg, dict):
+        auto_cfg = {}
+        cfg["financeiro_envio_auto_documentos"] = auto_cfg
+    return auto_cfg
+
+
 def run_auto_documents(
     cfg: Dict[str, Any],
     *,
@@ -163,17 +215,24 @@ def run_auto_documents(
     now: Optional[datetime] = None,
     force: bool = False,
     allow_resend: bool = False,
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     system_logger = get_system_logger()
     docs_generated_logger = get_docs_generated_logger()
     docs_sent_logger = get_docs_sent_logger()
 
     now = now or datetime.now()
+    
+    def _emit(payload: Dict[str, Any]):
+        cb = progress_cb
+        if cb is None:
+            return
+        try:
+            cb(dict(payload or {}))
+        except Exception:
+            return
 
-    auto_cfg = cfg.get("financeiro_envio_auto_documentos")
-    if not isinstance(auto_cfg, dict):
-        auto_cfg = {}
-        cfg["financeiro_envio_auto_documentos"] = auto_cfg
+    auto_cfg = _effective_auto_docs_cfg(cfg)
 
     enabled = bool(auto_cfg.get("enabled", False))
     try:
@@ -189,6 +248,7 @@ def run_auto_documents(
     window_end = now
     window_start = now - timedelta(hours=interval_hours)
     window_text = f"{window_start.strftime('%d/%m/%Y %H:%M')} até {window_end.strftime('%d/%m/%Y %H:%M')}"
+    _emit({"stage": "start", "message": "Iniciando...", "window_text": window_text, "dry_run": bool(dry_run)})
 
     history = DocumentsHistory()
     lock_path = str(getattr(history, "db_path", "")).strip()
@@ -211,10 +271,12 @@ def run_auto_documents(
 
     discovered_rows: List[Dict[str, Any]] = []
     try:
+        _emit({"stage": "scan", "message": "Buscando documentos gerados...", "window_text": window_text})
         discovered_rows = Database(cfg).list_generated_boletos(window_start, window_end)
     except Exception as e:
         history.finish_run(run_id, "error", {"error": str(e)})
         raise
+    _emit({"stage": "scan_done", "message": f"Encontrados: {len(discovered_rows)}", "discovered": len(discovered_rows), "window_text": window_text})
 
     skipped_duplicates = 0
     kept_sent = 0
@@ -263,6 +325,7 @@ def run_auto_documents(
     discovered_grids = [str(r.get("boleto_grid") or "").strip() for r in discovered_rows if str(r.get("boleto_grid") or "").strip()]
     pending_records = history.list_pending_by_grids(discovered_grids)
     pending_before = len(pending_records)
+    _emit({"stage": "pending", "message": "Separando pendências...", "pending_before": int(pending_before)})
     pending_grids = [p.boleto_grid for p in pending_records if str(p.boleto_grid or "").strip()]
     if len(pending_grids) > batch_size:
         pending_grids = pending_grids[:batch_size]
@@ -282,6 +345,7 @@ def run_auto_documents(
         emails_planned = len(grouped_keys)
         pending_grids = []
         planned_to_set = planned_emails
+        _emit({"stage": "planned", "message": f"Planejados: {int(emails_planned)}", "emails_planned": int(emails_planned), "docs_no_email": int(docs_no_email)})
 
     if pending_grids:
 
@@ -356,8 +420,19 @@ def run_auto_documents(
 
         if grouped:
             emails_planned += len([g for g in grouped.values() if (g.get("to_email") or "").strip()])
+        total_targets = len([g for g in grouped.values() if (g.get("to_email") or "").strip()])
+        _emit(
+            {
+                "stage": "planning_done",
+                "message": f"Planejados: {int(emails_planned)}",
+                "emails_planned": int(emails_planned),
+                "total_targets": int(total_targets),
+                "docs_no_email": int(docs_no_email),
+                "pending_before": int(pending_before),
+            }
+        )
 
-        for g in grouped.values():
+        for target_i, g in enumerate([g for g in grouped.values() if (g.get("to_email") or "").strip()], start=1):
             rows = g.get("rows") or []
             if not rows:
                 continue
@@ -365,6 +440,21 @@ def run_auto_documents(
             if not to_email:
                 continue
             planned_to_set.add(str(to_email))
+            _emit(
+                {
+                    "stage": "target_start",
+                    "message": "Preparando anexos...",
+                    "current": int(target_i),
+                    "total": int(total_targets),
+                    "customer_name": str(g.get("customer_name") or "").strip(),
+                    "to_email": str(to_email),
+                    "emails_sent": int(emails_sent),
+                    "failed_emails": int(failed_emails),
+                    "docs_sent": int(docs_sent),
+                    "docs_failed": int(docs_failed),
+                    "docs_no_email": int(docs_no_email),
+                }
+            )
 
             invoices: List[InvoiceRow] = []
             items: List[Tuple[str, InvoiceRow]] = []
@@ -471,14 +561,30 @@ def run_auto_documents(
             except Exception:
                 purchase_map = {}
 
+            fatura_txt: Optional[Tuple[bytes, str]] = None
+            try:
+                from ui import build_faturas_detalhamento_txt_bytes
+
+                txt_bytes, txt_name = build_faturas_detalhamento_txt_bytes(invoices, purchase_info_map=purchase_map)
+                if txt_bytes and txt_name:
+                    fatura_txt = (txt_bytes, txt_name)
+            except Exception:
+                fatura_txt = None
+            if fatura_txt:
+                attachments_total += 1
+
             max_attachments = 18
             max_bytes = 15 * 1024 * 1024
+            reserved_count = 1 if fatura_txt else 0
+            reserved_bytes = len(fatura_txt[0]) if fatura_txt else 0
+            usable_max_attachments = max(1, max_attachments - reserved_count)
+            usable_max_bytes = max(1024, max_bytes - reserved_bytes)
             batches: List[List[Tuple[bytes, str, str]]] = []
             current: List[Tuple[bytes, str, str]] = []
             current_bytes = 0
             for data, name, bg in attachments:
                 size = len(data) if data else 0
-                if current and (len(current) >= max_attachments or (current_bytes + size) > max_bytes):
+                if current and (len(current) >= usable_max_attachments or (current_bytes + size) > usable_max_bytes):
                     batches.append(current)
                     current = []
                     current_bytes = 0
@@ -486,16 +592,52 @@ def run_auto_documents(
                 current_bytes += size
             if current or not attachments:
                 batches.append(current)
+            _emit(
+                {
+                    "stage": "target_ready",
+                    "message": "Enviando...",
+                    "current": int(target_i),
+                    "total": int(total_targets),
+                    "customer_name": invoices[0].customer_name if invoices else str(g.get("customer_name") or "").strip(),
+                    "to_email": str(to_email),
+                    "batch_total": int(len(batches)),
+                    "emails_sent": int(emails_sent),
+                    "failed_emails": int(failed_emails),
+                    "docs_sent": int(docs_sent),
+                    "docs_failed": int(docs_failed),
+                    "docs_no_email": int(docs_no_email),
+                }
+            )
 
             for idx, batch in enumerate(batches, start=1):
+                _emit(
+                    {
+                        "stage": "batch_sending",
+                        "message": "Enviando e-mail...",
+                        "current": int(target_i),
+                        "total": int(total_targets),
+                        "customer_name": invoices[0].customer_name if invoices else str(g.get("customer_name") or "").strip(),
+                        "to_email": str(to_email),
+                        "batch_idx": int(idx),
+                        "batch_total": int(len(batches)),
+                        "emails_sent": int(emails_sent),
+                        "failed_emails": int(failed_emails),
+                        "docs_sent": int(docs_sent),
+                        "docs_failed": int(docs_failed),
+                        "docs_no_email": int(docs_no_email),
+                    }
+                )
                 if not first_email and delay_seconds > 0:
                     time.sleep(delay_seconds)
                 first_email = False
-                flags = {"boleto": False, "fatura_pdf": False, "xml": False, "danfe": False, "assinatura": False}
+                flags = {"boleto": False, "fatura_pdf": False, "fatura_txt": False, "xml": False, "danfe": False, "assinatura": False}
                 try:
                     from ui import _detect_email_attachment_flags
 
-                    flags = _detect_email_attachment_flags([name for data, name, _bg in batch if data])
+                    flag_names = [name for data, name, _bg in batch if data]
+                    if fatura_txt:
+                        flag_names.append(fatura_txt[1])
+                    flags = _detect_email_attachment_flags(flag_names)
                 except Exception:
                     flags = flags
 
@@ -517,6 +659,9 @@ def run_auto_documents(
                 msg.set_content(text_body)
                 msg.add_alternative(html_body, subtype="html")
                 grids_in_batch: List[str] = []
+                if fatura_txt:
+                    maintype, subtype = _mime_parts_from_filename(fatura_txt[1])
+                    msg.add_attachment(fatura_txt[0], maintype=maintype, subtype=subtype, filename=fatura_txt[1])
                 for data, name, bg in batch:
                     if not data:
                         continue
@@ -540,12 +685,47 @@ def run_auto_documents(
                                 invoices[0].customer_name if invoices else "",
                                 window_text,
                             )
+                    _emit(
+                        {
+                            "stage": "batch_sent",
+                            "message": "Enviado",
+                            "current": int(target_i),
+                            "total": int(total_targets),
+                            "customer_name": invoices[0].customer_name if invoices else str(g.get("customer_name") or "").strip(),
+                            "to_email": str(to_email),
+                            "batch_idx": int(idx),
+                            "batch_total": int(len(batches)),
+                            "emails_sent": int(emails_sent),
+                            "failed_emails": int(failed_emails),
+                            "docs_sent": int(docs_sent),
+                            "docs_failed": int(docs_failed),
+                            "docs_no_email": int(docs_no_email),
+                        }
+                    )
                 except Exception as e:
                     failed_emails += 1
                     if grids_in_batch:
                         history.mark_failed(grids_in_batch, error=str(e))
                         docs_failed += len(grids_in_batch)
                     system_logger.error("Falha ao enviar docs para=%s erro=%s", to_email, e)
+                    _emit(
+                        {
+                            "stage": "batch_failed",
+                            "message": "Falha",
+                            "current": int(target_i),
+                            "total": int(total_targets),
+                            "customer_name": invoices[0].customer_name if invoices else str(g.get("customer_name") or "").strip(),
+                            "to_email": str(to_email),
+                            "batch_idx": int(idx),
+                            "batch_total": int(len(batches)),
+                            "emails_sent": int(emails_sent),
+                            "failed_emails": int(failed_emails),
+                            "docs_sent": int(docs_sent),
+                            "docs_failed": int(docs_failed),
+                            "docs_no_email": int(docs_no_email),
+                            "error": str(e),
+                        }
+                    )
 
     result = {
         "enabled": bool(enabled),
@@ -570,6 +750,21 @@ def run_auto_documents(
     }
 
     history.finish_run(run_id, ("dry_run" if dry_run else "ok"), result)
+    _emit(
+        {
+            "stage": "done",
+            "message": "Concluído.",
+            "result": dict(result),
+            "discovered": int(result.get("discovered") or 0),
+            "pending_before": int(result.get("pending_before") or 0),
+            "emails_planned": int(result.get("emails_planned") or 0),
+            "emails_sent": int(result.get("emails_sent") or 0),
+            "failed_emails": int(result.get("failed_emails") or 0),
+            "docs_sent": int(result.get("docs_sent") or 0),
+            "docs_failed": int(result.get("docs_failed") or 0),
+            "docs_no_email": int(result.get("docs_no_email") or 0),
+        }
+    )
     try:
         history.vacuum()
     except Exception:

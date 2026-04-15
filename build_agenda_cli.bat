@@ -65,7 +65,7 @@ if errorlevel 1 goto erro
 
 if exist "config.json" copy /Y "config.json" "%PORTABLE_DIR%\config.json" >nul
 if exist "databrev.key" copy /Y "databrev.key" "%PORTABLE_DIR%\databrev.key" >nul
-if exist "audit.log" copy /Y "audit.log" "%PORTABLE_DIR%\audit.log" >nul
+if exist "log" xcopy /E /I /Y "log" "%PORTABLE_DIR%\log" >nul
 
 echo.
 echo ==========================================
