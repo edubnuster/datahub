@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 from datetime import date, datetime
 import base64
 import os
+import re
 import psycopg2
 import psycopg2.extras
 from .helpers import AppError
@@ -35,6 +36,138 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute("select 1")
                 cur.fetchone()
+
+    def _get_table_columns(self, conn, table_name: str) -> set:
+        t = str(table_name or "").strip().lower()
+        if not t:
+            return set()
+        cached = self._table_columns_cache.get(t)
+        if cached is not None:
+            return cached
+        cols: set = set()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT column_name
+                      FROM information_schema.columns
+                     WHERE table_schema = 'public'
+                       AND table_name = %s
+                    """,
+                    (t,),
+                )
+                cols = {str(r[0]).strip().lower() for r in (cur.fetchall() or []) if r and r[0]}
+        except Exception:
+            cols = set()
+        self._table_columns_cache[t] = cols
+        return cols
+
+    def _format_cep(self, cep: Any) -> str:
+        s = "".join([c for c in str(cep or "") if c.isdigit()])
+        if len(s) == 8:
+            return f"{s[:5]}-{s[5:]}"
+        return str(cep or "").strip()
+
+    def _empresa_endereco_str(self, conn, empresa_id: Any) -> str:
+        try:
+            eid = int(empresa_id)
+        except Exception:
+            return ""
+        cols = self._get_table_columns(conn, "empresa")
+        if not cols:
+            return ""
+
+        def pick(*names: str) -> Optional[str]:
+            for n in names:
+                if str(n).lower() in cols:
+                    return str(n).lower()
+            return None
+
+        c_log = pick("logradouro", "endereco", "rua")
+        c_num = pick("numero", "nro", "num")
+        c_bai = pick("bairro")
+        c_cid = pick("cidade", "municipio")
+        c_uf = pick("uf", "estado")
+        c_cep = pick("cep")
+        c_cpl = pick("complemento", "cpl")
+
+        select_parts: List[str] = []
+        if c_log:
+            select_parts.append(f"{c_log} as logradouro")
+        if c_num:
+            select_parts.append(f"{c_num} as numero")
+        if c_cpl:
+            select_parts.append(f"{c_cpl} as complemento")
+        if c_bai:
+            select_parts.append(f"{c_bai} as bairro")
+        if c_cid:
+            select_parts.append(f"{c_cid} as cidade")
+        if c_uf:
+            select_parts.append(f"{c_uf} as uf")
+        if c_cep:
+            select_parts.append(f"{c_cep} as cep")
+        if not select_parts:
+            return ""
+
+        sql = "SELECT " + ", ".join(select_parts) + " FROM empresa WHERE grid = %s"
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, (eid,))
+                r = cur.fetchone() or {}
+        except Exception:
+            return ""
+
+        logradouro = str(r.get("logradouro") or "").strip()
+        numero = str(r.get("numero") or "").strip()
+        complemento = str(r.get("complemento") or "").strip()
+        bairro = str(r.get("bairro") or "").strip()
+        cidade = str(r.get("cidade") or "").strip()
+        uf = str(r.get("uf") or "").strip()
+        cep = self._format_cep(r.get("cep"))
+
+        first = logradouro
+        if numero:
+            first = (first + f", {numero}").strip(", ")
+        if complemento:
+            first = (first + f" - {complemento}").strip(" -")
+
+        mid = bairro
+        tail = ""
+        if cidade and uf:
+            tail = f"{cidade}/{uf}"
+        elif cidade:
+            tail = cidade
+        elif uf:
+            tail = uf
+        if cep:
+            tail = (tail + f" - CEP {cep}").strip(" -")
+
+        parts = [p for p in [first, mid, tail] if p]
+        return " - ".join(parts).strip()
+
+    def _boleto_info_sacado_cep(self, conn, boleto_info_id: Any) -> str:
+        try:
+            bi_id = int(boleto_info_id)
+        except Exception:
+            return ""
+        cols = self._get_table_columns(conn, "boleto_info")
+        if not cols:
+            return ""
+        cep_col = None
+        for n in ("sacado_cep", "cep", "cep_sacado"):
+            if n in cols:
+                cep_col = n
+                break
+        if not cep_col:
+            return ""
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {cep_col} FROM boleto_info WHERE grid = %s", (bi_id,))
+                r = cur.fetchone()
+                v = r[0] if r else ""
+        except Exception:
+            v = ""
+        return self._format_cep(v)
 
     def list_inactive_customers(self, inactive_months: int = 3) -> List[Dict[str, Any]]:
         sql_text = (self.config.get("queries", {}).get("list_inactive_customers_sql") or "").strip()
@@ -564,6 +697,11 @@ class Database:
                 bi.documento,
                 bi.vencto,
                 bi.valor,
+                bi.multa_prazo,
+                bi.multa_valor,
+                bi.multa_perc,
+                bi.juros_valor_dia,
+                bi.juros_perc_mes,
                 bi.sacado_nome,
                 bi.sacado_inscricao,
                 bi.sacado_endereco,
@@ -586,7 +724,8 @@ class Database:
                 cc.digito as conta_digito,
                 cc.modelo_boleto,
                 e.cpf as cedente_documento,
-                pessoa_nome_f(e.grid) as cedente_nome
+                pessoa_nome_f(e.grid) as cedente_nome,
+                e.grid as cedente_empresa_id
             from boleto b
             left join boleto_info bi on bi.grid = b.boleto_info
             left join portador p on p.grid = b.portador
@@ -603,6 +742,14 @@ class Database:
                 cur.execute(sql, (invoice_id_val,))
                 row = cur.fetchone()
                 if row:
+                    try:
+                        row["cedente_endereco"] = self._empresa_endereco_str(conn, row.get("cedente_empresa_id"))
+                    except Exception:
+                        row["cedente_endereco"] = ""
+                    try:
+                        row["sacado_cep"] = self._boleto_info_sacado_cep(conn, row.get("boleto_info"))
+                    except Exception:
+                        row["sacado_cep"] = ""
                     open_banking_sql = """
                         select
                             pdf.arquivo_pdf,
@@ -704,6 +851,11 @@ class Database:
                 bi.documento,
                 bi.vencto,
                 bi.valor,
+                bi.multa_prazo,
+                bi.multa_valor,
+                bi.multa_perc,
+                bi.juros_valor_dia,
+                bi.juros_perc_mes,
                 bi.sacado_nome,
                 bi.sacado_inscricao,
                 bi.sacado_endereco,
@@ -726,7 +878,8 @@ class Database:
                 cc.digito as conta_digito,
                 cc.modelo_boleto,
                 e.cpf as cedente_documento,
-                pessoa_nome_f(e.grid) as cedente_nome
+                pessoa_nome_f(e.grid) as cedente_nome,
+                e.grid as cedente_empresa_id
             FROM boleto b
             LEFT JOIN boleto_info bi ON bi.grid = b.boleto_info
             LEFT JOIN portador p ON p.grid = b.portador
@@ -742,10 +895,28 @@ class Database:
         by_movto: Dict[int, Dict[str, Any]] = {}
         with self._connect() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                addr_cache: Dict[int, str] = {}
+                cep_cache: Dict[int, str] = {}
                 cur.execute(sql, (invoice_ids_sql,))
                 rows = cur.fetchall() or []
                 for r in rows:
                     d = dict(r)
+                    try:
+                        eid = int(d.get("cedente_empresa_id") or 0)
+                    except Exception:
+                        eid = 0
+                    if eid:
+                        if eid not in addr_cache:
+                            addr_cache[eid] = self._empresa_endereco_str(conn, eid)
+                        d["cedente_endereco"] = addr_cache.get(eid) or ""
+                    try:
+                        bi_id = int(d.get("boleto_info") or 0)
+                    except Exception:
+                        bi_id = 0
+                    if bi_id:
+                        if bi_id not in cep_cache:
+                            cep_cache[bi_id] = self._boleto_info_sacado_cep(conn, bi_id)
+                        d["sacado_cep"] = cep_cache.get(bi_id) or ""
                     movto = d.get("movto")
                     if movto in (None, "", 0, "0"):
                         continue
@@ -995,7 +1166,8 @@ class Database:
                 cc.digito as conta_digito,
                 cc.modelo_boleto,
                 e.cpf as cedente_documento,
-                pessoa_nome_f(e.grid) as cedente_nome
+                pessoa_nome_f(e.grid) as cedente_nome,
+                e.grid as cedente_empresa_id
             FROM boleto b
             LEFT JOIN boleto_info bi ON bi.grid = b.boleto_info
             LEFT JOIN portador p ON p.grid = b.portador
@@ -1034,6 +1206,24 @@ class Database:
                 cur.execute(sql, (bg_sql,))
                 for r in cur.fetchall() or []:
                     data = dict(r)
+                    try:
+                        eid = int(data.get("cedente_empresa_id") or 0)
+                    except Exception:
+                        eid = 0
+                    if eid:
+                        try:
+                            data["cedente_endereco"] = self._empresa_endereco_str(conn, eid)
+                        except Exception:
+                            data["cedente_endereco"] = ""
+                    try:
+                        bi_id = int(data.get("boleto_info") or 0)
+                    except Exception:
+                        bi_id = 0
+                    if bi_id:
+                        try:
+                            data["sacado_cep"] = self._boleto_info_sacado_cep(conn, bi_id)
+                        except Exception:
+                            data["sacado_cep"] = ""
                     bg = data.get("boleto_grid")
                     try:
                         bg_i = int(bg)
@@ -1227,6 +1417,7 @@ class Database:
 
         dt_expr = "inv.hora" if meta.get("has_hora") else "inv.data"
         sale_dt_expr = "s.hora" if meta.get("has_hora") else "s.data"
+        sale2_dt_expr = "s2.hora" if meta.get("has_hora") else "s2.data"
         prod_expr = "produto_nome_f(l.produto)" if meta.get("has_produto_nome_f") else "l.produto::text"
 
         sql = f"""
@@ -1234,6 +1425,7 @@ class Database:
                 inv.grid as invoice_id,
                 inv.valor as invoice_amount,
                 inv.documento as documento,
+                inv.grid as doc_movto_id,
                 {dt_expr} as dt,
                 nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
                 sum(coalesce(l.quantidade, 0)) as quantity,
@@ -1243,7 +1435,7 @@ class Database:
               on l.mlid = inv.mlid
             where inv.grid = any(%s)
               and l.operacao = 'V'
-            group by inv.grid, inv.valor, inv.documento, {dt_expr}, product_name
+            group by inv.grid, inv.valor, inv.documento, inv.grid, {dt_expr}, product_name
 
             union all
 
@@ -1251,6 +1443,7 @@ class Database:
                 inv.grid as invoice_id,
                 inv.valor as invoice_amount,
                 s.documento as documento,
+                s.grid as doc_movto_id,
                 {sale_dt_expr} as dt,
                 nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
                 sum(coalesce(l.quantidade, 0)) as quantity,
@@ -1268,19 +1461,89 @@ class Database:
               and mm.parent <> 0
               and mm.child <> 0
               and l.operacao = 'V'
-            group by inv.grid, inv.valor, s.documento, {sale_dt_expr}, product_name
+            group by inv.grid, inv.valor, s.documento, s.grid, {sale_dt_expr}, product_name
+
+            union all
+
+            select
+                inv.grid as invoice_id,
+                inv.valor as invoice_amount,
+                s2.documento as documento,
+                s2.grid as doc_movto_id,
+                {sale2_dt_expr} as dt,
+                nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
+                sum(coalesce(l.quantidade, 0)) as quantity,
+                sum(coalesce(l.valor, 0)) as item_total
+            from movto_map mm1
+            join movto inv
+              on inv.grid = mm1.child
+            join movto m1
+              on m1.grid = mm1.parent
+            join movto_map mm2
+              on mm2.child = m1.grid
+            join movto s2
+              on s2.grid = mm2.parent
+            join lancto l
+              on l.mlid = s2.mlid
+            where mm1.child = any(%s)
+              and mm1.parent is not null
+              and mm1.child is not null
+              and mm1.parent <> 0
+              and mm1.child <> 0
+              and mm2.parent is not null
+              and mm2.child is not null
+              and mm2.parent <> 0
+              and mm2.child <> 0
+              and l.operacao = 'V'
+            group by inv.grid, inv.valor, s2.documento, s2.grid, {sale2_dt_expr}, product_name
 
             order by invoice_id, dt, documento, product_name
         """
 
         out: Dict[Any, Dict[str, Any]] = {}
+        header_map: Dict[int, Dict[str, str]] = {}
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (invoice_ids_sql, invoice_ids_sql))
+                cur.execute(sql, (invoice_ids_sql, invoice_ids_sql, invoice_ids_sql))
                 rows = cur.fetchall() or []
 
+            try:
+                movto_cols = self._get_table_columns(conn, "movto", schema="public")
+                pessoa_cols = self._get_table_columns(conn, "pessoa", schema="public")
+                doc_col = self._pick_existing_column(pessoa_cols, ["cpf", "cnpj", "cpf_cnpj", "cnpj_cpf", "documento"])
+                obs_col = self._pick_existing_column(movto_cols, ["obs", "observacao", "observacoes", "historico", "hist", "obs1", "obs2"])
+                doc_expr = f"p.{doc_col}::text as customer_doc" if doc_col else "NULL::text as customer_doc"
+                obs_expr = f"inv.{obs_col}::text as invoice_obs" if obs_col else "NULL::text as invoice_obs"
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        select
+                            inv.grid as invoice_id,
+                            {doc_expr},
+                            {obs_expr}
+                        from movto inv
+                        left join pessoa p
+                          on p.grid = inv.pessoa
+                        where inv.grid = any(%(invoice_ids)s::bigint[])
+                        """,
+                        {"invoice_ids": invoice_ids_sql},
+                    )
+                    for invoice_id, customer_doc, invoice_obs in (cur.fetchall() or []):
+                        if invoice_id in (None, "", 0, "0"):
+                            continue
+                        try:
+                            inv_int = int(invoice_id)
+                        except Exception:
+                            continue
+                        header_map[inv_int] = {
+                            "customer_doc": str(customer_doc or "").strip(),
+                            "invoice_obs": str(invoice_obs or "").strip(),
+                        }
+            except Exception:
+                header_map = {}
+
         tmp: Dict[int, Dict[str, Any]] = {}
-        for invoice_id, invoice_amount, documento, dt, product_name, quantity, item_total in rows:
+        for invoice_id, invoice_amount, documento, doc_movto_id, dt, product_name, quantity, item_total in rows:
             try:
                 inv_num = float(invoice_amount) if invoice_amount not in (None, "") else None
             except Exception:
@@ -1297,10 +1560,12 @@ class Database:
             doc_key = str(documento or "").strip() or "N/A"
             doc = slot["documents"].get(doc_key)
             if not doc:
-                doc = {"documento": doc_key, "dt": dt, "items": {}, "total": 0.0}
+                doc = {"documento": doc_key, "dt": dt, "items": {}, "total": 0.0, "movto_id": doc_movto_id}
                 slot["documents"][doc_key] = doc
             if doc.get("dt") in (None, "") and dt not in (None, ""):
                 doc["dt"] = dt
+            if doc.get("movto_id") in (None, "", 0, "0") and doc_movto_id not in (None, "", 0, "0"):
+                doc["movto_id"] = doc_movto_id
             item_key = str(product_name or "").strip() or "Item"
             it = doc["items"].get(item_key)
             if not it:
@@ -1319,15 +1584,114 @@ class Database:
             except Exception:
                 pass
 
+        movto_doc_ids: List[int] = []
+        for slot in (tmp or {}).values():
+            for d in (slot.get("documents") or {}).values():
+                mid = d.get("movto_id")
+                if mid in (None, "", 0, "0"):
+                    continue
+                try:
+                    movto_doc_ids.append(int(mid))
+                except Exception:
+                    continue
+        movto_doc_ids = sorted(list(set(movto_doc_ids)))
+
+        placa_km_by_movto: Dict[int, Dict[str, str]] = {}
+        if movto_doc_ids:
+            try:
+                with self._connect() as conn:
+                    mi_cols = self._get_table_columns(conn, "movto_info", schema="public")
+                    fk_col = self._pick_existing_column(mi_cols, ["movto", "movto_id"])
+                    tipo_col = self._pick_existing_column(mi_cols, ["tipo", "tipo_info", "chave"])
+                    info_col = self._pick_existing_column(mi_cols, ["info", "valor", "conteudo", "texto"])
+                    if fk_col and tipo_col and info_col:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                f"""
+                                select
+                                    mi.{fk_col} as movto_id,
+                                    lower(mi.{tipo_col}::text) as tipo,
+                                    mi.{info_col}::text as info
+                                from movto_info mi
+                                where mi.{fk_col} = any(%(ids)s::bigint[])
+                                  and lower(mi.{tipo_col}::text) in ('placa','km','media_km','quilometragem','odometro','hodometro','nao_detalhar_km')
+                                """,
+                                {"ids": movto_doc_ids},
+                            )
+                            for movto_id, tipo, info in (cur.fetchall() or []):
+                                if movto_id in (None, "", 0, "0"):
+                                    continue
+                                try:
+                                    mid = int(movto_id)
+                                except Exception:
+                                    continue
+                                slot = placa_km_by_movto.get(mid)
+                                if not slot:
+                                    slot = {}
+                                    placa_km_by_movto[mid] = slot
+                                tipo = str(tipo or "").strip().lower()
+                                info = str(info or "").strip()
+                                if not tipo or not info:
+                                    continue
+                                if tipo == "placa":
+                                    cand = re.sub(r"[^A-Za-z0-9]+", "", info).upper()
+                                    if not cand:
+                                        continue
+                                    is_valid = False
+                                    if len(cand) == 7:
+                                        if re.match(r"^[A-Z]{3}[0-9]{4}$", cand):
+                                            is_valid = True
+                                        elif re.match(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$", cand):
+                                            is_valid = True
+                                    if is_valid:
+                                        if not slot.get("placa_valid"):
+                                            slot["placa"] = cand
+                                            slot["placa_valid"] = True
+                                    else:
+                                        if not slot.get("placa"):
+                                            slot["placa"] = cand
+                                            slot["placa_valid"] = False
+                                elif tipo == "nao_detalhar_km":
+                                    slot["no_detail_km"] = True
+                                else:
+                                    if not re.search(r"\d", info):
+                                        continue
+                                    if slot.get("no_detail_km"):
+                                        continue
+                                    if tipo == "media_km":
+                                        if not slot.get("km"):
+                                            slot["km"] = info
+                                        continue
+                                    if not slot.get("km"):
+                                        slot["km"] = info
+            except Exception:
+                placa_km_by_movto = {}
+
         for invoice_id in invoice_ids_sql:
             slot = tmp.get(int(invoice_id))
+            hdr = header_map.get(int(invoice_id)) or {}
             if not slot:
-                out[invoice_id] = {"purchase_dt": None, "purchase_dt_start": None, "purchase_dt_end": None, "invoice_amount": None, "items_total": None, "documents": []}
+                out[invoice_id] = {
+                    "purchase_dt": None,
+                    "purchase_dt_start": None,
+                    "purchase_dt_end": None,
+                    "invoice_amount": None,
+                    "items_total": None,
+                    "documents": [],
+                    "customer_doc": hdr.get("customer_doc") or "",
+                    "invoice_obs": hdr.get("invoice_obs") or "",
+                }
                 out[str(invoice_id)] = out[invoice_id]
                 continue
             documents = []
             items_total = 0.0
             for doc in slot["documents"].values():
+                mid = doc.get("movto_id")
+                try:
+                    mid_int = int(mid) if mid not in (None, "", 0, "0") else None
+                except Exception:
+                    mid_int = None
+                pk = placa_km_by_movto.get(mid_int) if mid_int is not None else {}
                 items = [v for _, v in sorted((doc.get("items") or {}).items(), key=lambda kv: kv[0].lower())]
                 total = float(doc.get("total") or 0)
                 items_total += total
@@ -1337,6 +1701,9 @@ class Database:
                         "dt": doc.get("dt"),
                         "total": total,
                         "items": items,
+                        "movto_id": doc.get("movto_id"),
+                        "placa": (pk or {}).get("placa") or "",
+                        "km": (pk or {}).get("km") or "",
                     }
                 )
             documents.sort(key=lambda d: (str(d.get("dt") or ""), str(d.get("documento") or "")))
@@ -1347,9 +1714,206 @@ class Database:
                 "invoice_amount": slot.get("invoice_amount"),
                 "items_total": items_total,
                 "documents": documents,
+                "customer_doc": hdr.get("customer_doc") or "",
+                "invoice_obs": hdr.get("invoice_obs") or "",
             }
             out[str(invoice_id)] = out[invoice_id]
 
+        return out
+
+    @staticmethod
+    def _format_km_br(value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        cleaned = re.sub(r"[^\d,\.]", "", s)
+        if not cleaned:
+            return s
+        try:
+            if "," in cleaned and "." in cleaned:
+                num = float(cleaned.replace(".", "").replace(",", "."))
+            elif "," in cleaned:
+                num = float(cleaned.replace(".", "").replace(",", "."))
+            else:
+                num = float(cleaned)
+            return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return s
+
+    @staticmethod
+    def _normalize_placa(value: Any) -> str:
+        cand = re.sub(r"[^A-Za-z0-9]+", "", str(value or "").strip()).upper()
+        if not cand:
+            return ""
+        if len(cand) != 7:
+            return cand
+        if re.match(r"^[A-Z]{3}[0-9]{4}$", cand):
+            return cand
+        if re.match(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$", cand):
+            return cand
+        return cand
+
+    def get_placa_km_text_bulk(self, invoice_ids: List[Any]) -> Dict[Any, str]:
+        invoice_ids_sql = self._normalize_bigint_ids(invoice_ids)
+        if not invoice_ids_sql:
+            return {}
+
+        invoice_to_sales: Dict[int, List[int]] = {int(i): [int(i)] for i in invoice_ids_sql}
+
+        links: List[tuple] = []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select
+                        mm.child as invoice_id,
+                        mm.parent as sale_id
+                    from movto_map mm
+                    where mm.child = any(%(invoice_ids)s::bigint[])
+                      and mm.parent is not null
+                      and mm.child is not null
+                      and mm.parent <> 0
+                      and mm.child <> 0
+
+                    union all
+
+                    select
+                        mm1.child as invoice_id,
+                        mm2.parent as sale_id
+                    from movto_map mm1
+                    join movto_map mm2
+                      on mm2.child = mm1.parent
+                    where mm1.child = any(%(invoice_ids)s::bigint[])
+                      and mm1.parent is not null
+                      and mm1.child is not null
+                      and mm1.parent <> 0
+                      and mm1.child <> 0
+                      and mm2.parent is not null
+                      and mm2.child is not null
+                      and mm2.parent <> 0
+                      and mm2.child <> 0
+                    """,
+                    {"invoice_ids": invoice_ids_sql},
+                )
+                links = cur.fetchall() or []
+
+        for invoice_id, sale_id in links:
+            try:
+                inv_int = int(invoice_id)
+                sale_int = int(sale_id)
+            except Exception:
+                continue
+            slot = invoice_to_sales.get(inv_int)
+            if not slot:
+                slot = [inv_int]
+                invoice_to_sales[inv_int] = slot
+            slot.append(sale_int)
+
+        sale_ids_all: List[int] = []
+        for mids in invoice_to_sales.values():
+            for m in mids:
+                if m not in (None, 0):
+                    sale_ids_all.append(int(m))
+        sale_ids_all = sorted(list(set(sale_ids_all)))
+
+        info_rows: List[tuple] = []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select
+                        mi.movto as movto_id,
+                        lower(mi.tipo::text) as tipo,
+                        mi.info::text as info
+                    from movto_info mi
+                    where mi.movto = any(%(movto_ids)s::bigint[])
+                      and lower(mi.tipo::text) in ('placa','km','media_km','nao_detalhar_km')
+                    order by mi.movto, mi.grid
+                    """,
+                    {"movto_ids": sale_ids_all},
+                )
+                info_rows = cur.fetchall() or []
+
+        sale_slot: Dict[int, Dict[str, Any]] = {}
+        for movto_id, tipo, info in info_rows:
+            try:
+                mid = int(movto_id)
+            except Exception:
+                continue
+            slot = sale_slot.get(mid)
+            if not slot:
+                slot = {"no_detail": False, "placa": "", "placa_valid": False, "km": ""}
+                sale_slot[mid] = slot
+            tipo = str(tipo or "").strip().lower()
+            info = str(info or "").strip()
+            if not tipo or not info:
+                continue
+            if tipo == "nao_detalhar_km":
+                slot["no_detail"] = True
+                continue
+            if tipo == "placa":
+                cand = self._normalize_placa(info)
+                if not cand:
+                    continue
+                is_valid = bool(re.match(r"^[A-Z]{3}[0-9]{4}$", cand) or re.match(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$", cand))
+                if is_valid:
+                    if not slot.get("placa_valid"):
+                        slot["placa"] = cand
+                        slot["placa_valid"] = True
+                else:
+                    if not slot.get("placa"):
+                        slot["placa"] = cand
+                continue
+            if tipo == "km":
+                if not slot.get("km") and re.search(r"\d", info):
+                    slot["km"] = info
+                continue
+            if tipo == "media_km":
+                continue
+
+        out: Dict[Any, str] = {}
+        for inv_id in invoice_ids_sql:
+            inv_int = int(inv_id)
+            sale_ids = invoice_to_sales.get(inv_int) or [inv_int]
+            sale_ids = [int(s) for s in sale_ids if s not in (None, 0)]
+            seen: Dict[str, float] = {}
+            ordered: List[str] = []
+            for s in sale_ids:
+                slot = sale_slot.get(int(s)) or {}
+                if slot.get("no_detail"):
+                    continue
+                placa = str(slot.get("placa") or "").strip().upper()
+                if not placa:
+                    continue
+                km_raw = str(slot.get("km") or "").strip()
+                km_txt = self._format_km_br(km_raw)
+                km_num = -1.0
+                if km_txt:
+                    try:
+                        km_num = float(km_txt.replace(".", "").replace(",", "."))
+                    except Exception:
+                        km_num = -1.0
+                prev = seen.get(placa)
+                if prev is None:
+                    seen[placa] = km_num
+                    ordered.append(placa)
+                else:
+                    if km_num > prev:
+                        seen[placa] = km_num
+
+            lines: List[str] = []
+            for placa in ordered:
+                km_num = seen.get(placa, -1.0)
+                km_txt = ""
+                if km_num >= 0:
+                    km_txt = self._format_km_br(km_num)
+                if km_txt:
+                    lines.append(f" Placa: {placa} - KM: {km_txt}")
+                else:
+                    lines.append(f" Placa: {placa}")
+            text = "\n".join(lines).rstrip()
+            out[inv_int] = text
+            out[str(inv_int)] = text
         return out
 
     def get_sale_signature_pdf(self, movto_id: Any) -> Dict[str, Any]:

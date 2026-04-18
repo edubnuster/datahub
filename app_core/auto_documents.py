@@ -498,6 +498,13 @@ def run_auto_documents(
             except Exception:
                 nfe_map = {}
 
+            purchase_map = {}
+            try:
+                movto_ids = [inv.movto_id for inv in invoices if getattr(inv, "movto_id", None) not in (None, "", 0, "0")]
+                purchase_map = Database(cfg).get_purchase_info_bulk(movto_ids)
+            except Exception:
+                purchase_map = {}
+
             for bg, inv in items:
                 boleto_data = payload_map.get(bg) or {}
                 try:
@@ -535,7 +542,16 @@ def run_auto_documents(
                     name = str(a.get("filename") or "").lower()
                     if not data or not name.endswith(".xml"):
                         continue
-                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(data, fallback_suffix=str(getattr(inv, "invoice_id", "") or getattr(inv, "movto_id", "") or ""))
+                    extra_inf = ""
+                    try:
+                        extra_inf = Database(cfg).get_placa_km_text_bulk([getattr(inv, "movto_id", None)]).get(getattr(inv, "movto_id", None)) or ""
+                    except Exception:
+                        extra_inf = ""
+                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(
+                        data,
+                        fallback_suffix=str(getattr(inv, "invoice_id", "") or getattr(inv, "movto_id", "") or ""),
+                        extra_inf_cpl_text=extra_inf,
+                    )
                     if pdf_bytes and pdf_name:
                         nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
                         has_pdf = True
@@ -553,13 +569,6 @@ def run_auto_documents(
             from ui import build_agenda_email_body
 
             subject = _subject(invoices[0].company if invoices else "", invoices[0].customer_name if invoices else "")
-
-            purchase_map = {}
-            try:
-                movto_ids = [inv.movto_id for inv in invoices if getattr(inv, "movto_id", None) not in (None, "", 0, "0")]
-                purchase_map = Database(cfg).get_purchase_info_bulk(movto_ids)
-            except Exception:
-                purchase_map = {}
 
             fatura_txt: Optional[Tuple[bytes, str]] = None
             try:

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
 import zlib
 
-from .constants import app_dir
+from .embedded_danfe_logo_kaninha import get_kaninha_danfe_logo_png_bytes
 
 
 def _pdf_escape(text: str) -> str:
@@ -308,6 +308,176 @@ def _wrap(text: str, max_chars: int) -> List[str]:
     return lines
 
 
+def build_inf_cpl_extra_from_purchase_map(
+    purchase_info_map: Optional[Dict[Any, Dict[str, Any]]],
+    invoice_key: Any,
+) -> str:
+    purchase_info_map = purchase_info_map or {}
+    info = purchase_info_map.get(invoice_key) or purchase_info_map.get(str(invoice_key)) or {}
+    documents = info.get("documents") or []
+    if not documents:
+        return ""
+
+    def _km_br(value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        cleaned = re.sub(r"[^\d,\.]", "", s)
+        if not cleaned:
+            return s
+        try:
+            if "," in cleaned and "." in cleaned:
+                num = float(cleaned.replace(".", "").replace(",", "."))
+            elif "," in cleaned:
+                num = float(cleaned.replace(".", "").replace(",", "."))
+            else:
+                num = float(cleaned)
+            return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return s
+
+    parts: List[str] = []
+    for d in documents:
+        placa = re.sub(r"[^A-Za-z0-9]+", "", str(d.get("placa") or "").strip()).upper()
+        if not placa:
+            continue
+        km = _km_br(d.get("km"))
+        if km:
+            parts.append(f"Placa: {placa} - KM: {km}")
+        else:
+            parts.append(f"Placa: {placa}")
+    return " ".join(parts).strip()
+
+
+def _build_pdf_bytes_pages(ops_pages: List[List[str]]) -> bytes:
+    page_width = 595
+    page_height = 842
+    streams = [("\n".join(ops or [])).encode("latin-1", errors="replace") for ops in (ops_pages or [])]
+    if not streams:
+        streams = [b""]
+    page_count = len(streams)
+
+    objects: List[bytes] = []
+    objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+    kids = ["3 0 R"]
+    base_id = 7
+    for i in range(2, page_count + 1):
+        page_id = base_id + (i - 2) * 2
+        kids.append(f"{page_id} 0 R")
+    kids_txt = " ".join(kids)
+    objects.append(f"2 0 obj\n<< /Type /Pages /Kids [{kids_txt}] /Count {page_count} >>\nendobj\n".encode("latin-1"))
+
+    objects.append(
+        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>\nendobj\n".encode(
+            "latin-1"
+        )
+    )
+    objects.append(b"4 0 obj\n<< /Length " + str(len(streams[0])).encode("ascii") + b" >>\nstream\n" + streams[0] + b"\nendstream\nendobj\n")
+    objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n")
+    objects.append(b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n")
+
+    next_id = 7
+    for page_i in range(2, page_count + 1):
+        page_id = next_id
+        content_id = next_id + 1
+        idx = page_i - 1
+        objects.append(
+            f"{page_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents {content_id} 0 R >>\nendobj\n".encode(
+                "latin-1"
+            )
+        )
+        objects.append(
+            b"%d 0 obj\n<< /Length %d >>\nstream\n" % (content_id, len(streams[idx]))
+            + streams[idx]
+            + b"\nendstream\nendobj\n"
+        )
+        next_id += 2
+
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects)+1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        pdf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF".encode("ascii"))
+    return bytes(pdf)
+
+
+def _build_pdf_bytes_with_xobjects_pages(
+    ops_pages: List[List[str]],
+    *,
+    xobjects: Dict[str, int],
+    extra_objects: List[bytes],
+) -> bytes:
+    page_width = 595
+    page_height = 842
+    streams = [("\n".join(ops or [])).encode("latin-1", errors="replace") for ops in (ops_pages or [])]
+    if not streams:
+        streams = [b""]
+    page_count = len(streams)
+
+    xobj_entries = " ".join([f"/{name} {int(obj_id)} 0 R" for name, obj_id in (xobjects or {}).items()])
+    xobj_block = f" /XObject << {xobj_entries} >>" if xobj_entries else ""
+
+    objects: List[bytes] = []
+    objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+    kids = ["3 0 R"]
+    base_id = 7 + len(extra_objects or [])
+    for i in range(2, page_count + 1):
+        page_id = base_id + (i - 2) * 2
+        kids.append(f"{page_id} 0 R")
+    kids_txt = " ".join(kids)
+    objects.append(f"2 0 obj\n<< /Type /Pages /Kids [{kids_txt}] /Count {page_count} >>\nendobj\n".encode("latin-1"))
+
+    objects.append(
+        f"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >>{xobj_block} >> /Contents 4 0 R >>\nendobj\n".encode(
+            "latin-1"
+        )
+    )
+    objects.append(b"4 0 obj\n<< /Length " + str(len(streams[0])).encode("ascii") + b" >>\nstream\n" + streams[0] + b"\nendstream\nendobj\n")
+    objects.append(b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n")
+    objects.append(b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n")
+    objects.extend(extra_objects or [])
+
+    next_id = 7 + len(extra_objects or [])
+    for page_i in range(2, page_count + 1):
+        page_id = next_id
+        content_id = next_id + 1
+        idx = page_i - 1
+        objects.append(
+            f"{page_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Resources << /Font << /F1 5 0 R /F2 6 0 R >>{xobj_block} >> /Contents {content_id} 0 R >>\nendobj\n".encode(
+                "latin-1"
+            )
+        )
+        objects.append(
+            b"%d 0 obj\n<< /Length %d >>\nstream\n" % (content_id, len(streams[idx]))
+            + streams[idx]
+            + b"\nendstream\nendobj\n"
+        )
+        next_id += 2
+
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects)+1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        pdf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF".encode("ascii"))
+    return bytes(pdf)
+
+
 def _extract_nfe_fields(xml_text: str) -> Dict[str, Any]:
     root = ET.fromstring(xml_text)
     ns = _xml_ns(root.tag)
@@ -361,6 +531,7 @@ def _extract_nfe_fields(xml_text: str) -> Dict[str, Any]:
     dest_end = dest.find(q("enderDest")) if dest is not None else None
     transp = inf.find(q("transp"))
     transporta = transp.find(q("transporta")) if transp is not None else None
+    veic = transp.find(q("veicTransp")) if transp is not None else None
     vol = transp.find(q("vol")) if transp is not None else None
     ide_tpNF = _t(ide.find(q("tpNF")) if ide is not None else None)
 
@@ -418,6 +589,9 @@ def _extract_nfe_fields(xml_text: str) -> Dict[str, Any]:
         "transp_xEnder": _t(transporta.find(q("xEnder")) if transporta is not None else None),
         "transp_xMun": _t(transporta.find(q("xMun")) if transporta is not None else None),
         "transp_UF": _t(transporta.find(q("UF")) if transporta is not None else None),
+        "transp_RNTC": _t(veic.find(q("RNTC")) if veic is not None else None),
+        "transp_placa": _t(veic.find(q("placa")) if veic is not None else None),
+        "transp_veic_UF": _t(veic.find(q("UF")) if veic is not None else None),
         "vol_qVol": _t(vol.find(q("qVol")) if vol is not None else None),
         "vol_esp": _t(vol.find(q("esp")) if vol is not None else None),
         "vol_marca": _t(vol.find(q("marca")) if vol is not None else None),
@@ -435,12 +609,16 @@ def _extract_nfe_fields(xml_text: str) -> Dict[str, Any]:
     return out
 
 
-def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_logo_png_bytes: Optional[bytes] = None) -> Tuple[Optional[bytes], str]:
+def danfe_pdf_from_nfe_xml(
+    xml_data: Any,
+    *,
+    fallback_suffix: str = "",
+    emit_logo_png_bytes: Optional[bytes] = None,
+    extra_inf_cpl_text: str = "",
+) -> Tuple[Optional[bytes], str]:
     if emit_logo_png_bytes is None:
         try:
-            p = app_dir() / "danfe_emitente_logo.png"
-            if p.is_file():
-                emit_logo_png_bytes = p.read_bytes()
+            emit_logo_png_bytes = get_kaninha_danfe_logo_png_bytes()
         except Exception:
             emit_logo_png_bytes = None
 
@@ -476,6 +654,29 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
     top = 822
     width = 555
     right = left + width
+
+    infcpl_src = str(fields.get("infCpl") or "").strip()
+    extra_inf_cpl_text = str(extra_inf_cpl_text or "").strip()
+    if extra_inf_cpl_text:
+        if infcpl_src:
+            if extra_inf_cpl_text not in infcpl_src:
+                infcpl_src = (extra_inf_cpl_text.rstrip() + "\n\n" + infcpl_src.lstrip()).strip()
+        else:
+            infcpl_src = extra_inf_cpl_text.strip()
+
+    fisco_src = str(fields.get("infAdicFisco") or "").strip()
+    has_fisco = bool(fisco_src)
+    infcpl_lines = _wrap(infcpl_src, 90 if has_fisco else 140)
+    fisco_lines = _wrap(fisco_src, 45) if has_fisco else []
+    first_cap = 8
+    rem_cpl = infcpl_lines[first_cap:]
+    rem_fisco = fisco_lines[first_cap:]
+    overflow = bool(rem_cpl or rem_fisco)
+    extra_pages = 0
+    big_cap = 92
+    if overflow:
+        extra_pages = max((len(rem_cpl) + big_cap - 1) // big_cap, (len(rem_fisco) + big_cap - 1) // big_cap, 1)
+    total_pages = 1 + extra_pages
 
     ops: List[str] = []
     extra_objects: List[bytes] = []
@@ -652,18 +853,22 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
     draw_line(left + w_emit_left, y, left + w_emit_left, y + emit_h)
     draw_text(left + w_emit_left/2, y + emit_h - 8, "IDENTIFICAÇÃO DO EMITENTE", size=6, align="center")
     if logo_name and logo_w > 0 and logo_h > 0:
-        max_w = w_emit_left - 10
-        max_h = 30
+        max_w = w_emit_left - 8
+        max_h = 38
         scale = min(max_w / float(logo_w), max_h / float(logo_h))
         dw = float(logo_w) * scale
         dh = float(logo_h) * scale
         x0 = left + (w_emit_left - dw) / 2
-        y_top = y + emit_h - 18
+        y_top = y + emit_h - 14
         y0 = y_top - dh
         draw_xobject(logo_name, x0, y0, dw, dh)
-        addr_y1 = y + emit_h - 55
-        addr_y2 = y + emit_h - 65
-        addr_y3 = y + emit_h - 75
+        addr_y1 = y0 - 12
+        addr_y2 = y0 - 22
+        addr_y3 = y0 - 32
+        if addr_y3 < y + 12:
+            addr_y3 = y + 12
+            addr_y2 = y + 22
+            addr_y1 = y + 32
     else:
         draw_text(left + w_emit_left/2, y + emit_h - 25, fields.get('emit_xNome'), size=9, bold=True, align="center", max_len=45)
         addr_y1 = y + emit_h - 40
@@ -692,7 +897,7 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
 
     draw_text(left + w_emit_left + w_emit_mid/2, y + emit_h - 70, f"Nº {nNF}", size=9, bold=True, align="center")
     draw_text(left + w_emit_left + w_emit_mid/2, y + emit_h - 80, f"SÉRIE {serie}", size=9, bold=True, align="center")
-    draw_text(left + w_emit_left + w_emit_mid/2, y + emit_h - 90, "Folha 1/1", size=7, align="center")
+    draw_text(left + w_emit_left + w_emit_mid/2, y + emit_h - 90, f"Folha 1/{total_pages}", size=7, align="center")
 
     # Right box (Barcode & Key)
     bc_x = left + w_emit_left + w_emit_mid + 10
@@ -710,8 +915,24 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
     draw_text(left + w_emit_left + w_emit_mid + 120, y + emit_h - 52, formatted_key, size=8, bold=True, align="center")
     
     draw_line(left + w_emit_left + w_emit_mid, y + emit_h - 58, right, y + emit_h - 58)
-    draw_text(left + w_emit_left + w_emit_mid + 120, y + emit_h - 66, "Consulta de autenticidade no portal nacional da NF-e", size=7, align="center")
-    draw_text(left + w_emit_left + w_emit_mid + 120, y + emit_h - 74, "www.nfe.fazenda.gov.br/portal ou no site da Sefaz Autorizadora", size=7, align="center")
+    consulta_top = y + emit_h - 58
+    consulta_bottom = y
+    consulta_center = (consulta_top + consulta_bottom) / 2.0
+    consulta_gap = 8
+    draw_text(
+        left + w_emit_left + w_emit_mid + 120,
+        int(round(consulta_center + (consulta_gap / 2.0))),
+        "Consulta de autenticidade no portal nacional da NF-e",
+        size=7,
+        align="center",
+    )
+    draw_text(
+        left + w_emit_left + w_emit_mid + 120,
+        int(round(consulta_center - (consulta_gap / 2.0))),
+        "www.nfe.fazenda.gov.br/portal ou no site da Sefaz Autorizadora",
+        size=7,
+        align="center",
+    )
 
     # Natureza / Protocolo
     y -= 25
@@ -736,7 +957,7 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
 
     # --- Destinatário / Remetente ---
     y -= 12
-    draw_text(left, y, "DESTINATÁRIO / REMETENTE", size=7, bold=True)
+    draw_text(left, y + 3, "DESTINATÁRIO / REMETENTE", size=7, bold=True)
     y -= 20
     draw_rect(left, y, width, 20)
     draw_line(right - 180, y, right - 180, y + 20)
@@ -789,7 +1010,7 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
     dups = fields.get("dups") or []
     if dups or fields.get("fat_nFat"):
         y -= 12
-        draw_text(left, y, "FATURA / DUPLICATAS", size=7, bold=True)
+        draw_text(left, y + 3, "FATURA / DUPLICATAS", size=7, bold=True)
         y -= 25
         draw_rect(left, y, width, 25)
         
@@ -804,7 +1025,7 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
 
     # --- Cálculo do Imposto ---
     y -= 12
-    draw_text(left, y, "CÁLCULO DO IMPOSTO", size=7, bold=True)
+    draw_text(left, y + 3, "CÁLCULO DO IMPOSTO", size=7, bold=True)
     
     y -= 20
     draw_rect(left, y, width, 20)
@@ -850,14 +1071,15 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
 
     # --- Transportador ---
     y -= 12
-    draw_text(left, y, "TRANSPORTADOR / VOLUMES TRANSPORTADOS", size=7, bold=True)
+    draw_text(left, y + 3, "TRANSPORTADOR / VOLUMES TRANSPORTADOS", size=7, bold=True)
     
     y -= 20
     draw_rect(left, y, width, 20)
     draw_line(right - 350, y, right - 350, y + 20)
     draw_line(right - 260, y, right - 260, y + 20)
-    draw_line(right - 150, y, right - 150, y + 20)
+    draw_line(right - 180, y, right - 180, y + 20)
     draw_line(right - 120, y, right - 120, y + 20)
+    draw_line(right - 90, y, right - 90, y + 20)
     draw_text(left + 2, y + 14, "NOME / RAZÃO SOCIAL", size=5)
     draw_text(left + 2, y + 4, fields.get('transp_xNome'), size=8, bold=True, max_len=45)
     draw_text(right - 348, y + 14, "FRETE POR CONTA", size=5)
@@ -871,11 +1093,13 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
     draw_text(right - 348, y + 4, frete_str, size=8, bold=True)
     
     draw_text(right - 258, y + 14, "CÓDIGO ANTT", size=5)
-    draw_text(right - 148, y + 14, "PLACA DO VEÍCULO", size=5)
+    draw_text(right - 258, y + 4, fields.get("transp_RNTC") or "", size=8, bold=True, max_len=14)
+    draw_text(right - 178, y + 14, "PLACA DO VEÍCULO", size=5, max_len=18)
+    draw_text(right - 178, y + 4, fields.get("transp_placa") or "", size=8, bold=True, max_len=8)
     draw_text(right - 118, y + 14, "UF", size=5)
-    draw_text(right - 118, y + 4, fields.get('transp_UF'), size=8, bold=True)
-    draw_text(right - 90, y + 14, "CNPJ / CPF", size=5)
-    draw_text(right - 90, y + 4, format_doc(fields.get('transp_CNPJ'), fields.get('transp_CPF')), size=8, bold=True)
+    draw_text(right - 118, y + 4, fields.get("transp_veic_UF") or fields.get('transp_UF') or "", size=8, bold=True, max_len=2)
+    draw_text(right - 88, y + 14, "CNPJ / CPF", size=5)
+    draw_text(right - 88, y + 4, format_doc(fields.get('transp_CNPJ'), fields.get('transp_CPF')), size=8, bold=True)
 
     y -= 20
     draw_rect(left, y, width, 20)
@@ -911,7 +1135,7 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
 
     # --- Itens ---
     y -= 12
-    draw_text(left, y, "DADOS DOS PRODUTOS / SERVIÇOS", size=7, bold=True)
+    draw_text(left, y + 3, "DADOS DOS PRODUTOS / SERVIÇOS", size=7, bold=True)
     
     # Header items
     y -= 15
@@ -962,28 +1186,93 @@ def danfe_pdf_from_nfe_xml(xml_data: Any, *, fallback_suffix: str = "", emit_log
 
     # --- Dados Adicionais ---
     y = items_area_bottom - 12
-    draw_text(left, y, "DADOS ADICIONAIS", size=7, bold=True)
+    draw_text(left, y + 3, "DADOS ADICIONAIS", size=7, bold=True)
     y -= 80
     draw_rect(left, y, width, 80)
-    w_adic = width * 0.65
-    draw_line(left + w_adic, y, left + w_adic, y + 80)
+    w_adic = width * 0.65 if has_fisco else width
+    if has_fisco:
+        draw_line(left + w_adic, y, left + w_adic, y + 80)
     draw_text(left + 2, y + 72, "INFORMAÇÕES COMPLEMENTARES", size=5)
     
-    infcpl = fields.get("infCpl") or ""
-    if infcpl:
+    if infcpl_lines:
         dy = y + 62
-        for line in _wrap(infcpl, 90)[:8]:
+        for line in infcpl_lines[:first_cap]:
             draw_text(left + 2, dy, line, size=6)
             dy -= 8
 
-    draw_text(left + w_adic + 2, y + 72, "RESERVADO AO FISCO", size=5)
-    fisco = fields.get("infAdicFisco") or ""
-    if fisco:
-        dy = y + 62
-        for line in _wrap(fisco, 45)[:8]:
-            draw_text(left + w_adic + 2, dy, line, size=6)
-            dy -= 8
+    if has_fisco:
+        draw_text(left + w_adic + 2, y + 72, "RESERVADO AO FISCO", size=5)
+        if fisco_lines:
+            dy = y + 62
+            for line in fisco_lines[:first_cap]:
+                draw_text(left + w_adic + 2, dy, line, size=6)
+                dy -= 8
+
+    ops_pages: List[List[str]] = [ops]
+    if extra_pages:
+        box_y = 60
+        box_h = 740
+        w_adic2 = width * 0.65 if has_fisco else width
+        title_y = 810
+        cap = int((box_h - 22) // 8)
+        for p in range(extra_pages):
+            start = p * cap
+            end = start + cap
+            cpl_chunk = rem_cpl[start:end]
+            fisco_chunk = rem_fisco[start:end]
+            page_ops: List[str] = []
+
+            def _p_draw_text(x, yv, text, size=9, bold=False, max_len=None, align="left"):
+                text = str(text or "").strip()
+                if max_len and len(text) > max_len:
+                    text = text[: max_len - 3] + "..."
+                if not text:
+                    return
+                approx_width = len(text) * (size * 0.5)
+                if align == "center":
+                    x = x - (approx_width / 2)
+                elif align == "right":
+                    x = x - approx_width
+                text = _pdf_escape(text)
+                font = "/F2" if bold else "/F1"
+                page_ops.append("BT")
+                page_ops.append(f"{font} {size} Tf")
+                page_ops.append(f"{x} {yv} Td")
+                page_ops.append(f"({text}) Tj")
+                page_ops.append("ET")
+
+            def _p_draw_line(x1, y1, x2, y2, lw=0.6):
+                page_ops.append(f"{lw} w")
+                page_ops.append(f"{x1} {y1} m")
+                page_ops.append(f"{x2} {y2} l")
+                page_ops.append("S")
+
+            def _p_draw_rect(x, yv, wv, hv, fill=False, lw=0.6):
+                page_ops.append(f"{lw} w")
+                page_ops.append(f"{x} {yv} {wv} {hv} re")
+                page_ops.append("f" if fill else "S")
+
+            _p_draw_text(left, title_y + 3, "DADOS ADICIONAIS", size=7, bold=True)
+            _p_draw_rect(left, box_y, width, box_h)
+            if has_fisco:
+                _p_draw_line(left + w_adic2, box_y, left + w_adic2, box_y + box_h)
+            _p_draw_text(left + 2, box_y + box_h - 8, "INFORMAÇÕES COMPLEMENTARES", size=5)
+            if has_fisco:
+                _p_draw_text(left + w_adic2 + 2, box_y + box_h - 8, "RESERVADO AO FISCO", size=5)
+
+            dy = box_y + box_h - 18
+            for line in cpl_chunk:
+                _p_draw_text(left + 2, dy, line, size=6)
+                dy -= 8
+
+            if has_fisco and fisco_chunk:
+                dy = box_y + box_h - 18
+                for line in fisco_chunk:
+                    _p_draw_text(left + w_adic2 + 2, dy, line, size=6)
+                    dy -= 8
+
+            ops_pages.append(page_ops)
 
     if xobjects and extra_objects:
-        return _build_pdf_bytes_with_xobjects(ops, xobjects=xobjects, extra_objects=extra_objects), filename
-    return _build_pdf_bytes(ops), filename
+        return _build_pdf_bytes_with_xobjects_pages(ops_pages, xobjects=xobjects, extra_objects=extra_objects), filename
+    return _build_pdf_bytes_pages(ops_pages), filename

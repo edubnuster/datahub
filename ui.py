@@ -221,6 +221,43 @@ def build_faturas_detalhamento_txt_bytes(
         except Exception:
             return 0.0
 
+    def _sanitize_inline(value: Any) -> str:
+        s = str(value or "")
+        s = s.replace("\r", " ").replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _format_doc_br(value: Any) -> str:
+        raw = _sanitize_inline(value)
+        if not raw:
+            return ""
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) == 11:
+            return f"{digits[:3]}.{digits[3:6]}.{digits[6:9]}-{digits[9:]}"
+        if len(digits) == 14:
+            return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+        return raw
+
+    def _wrap_text(value: Any, max_len: int) -> List[str]:
+        text = _sanitize_inline(value)
+        if not text:
+            return []
+        max_len = int(max_len or 0)
+        if max_len <= 0:
+            return [text]
+        out: List[str] = []
+        s = text
+        while s:
+            if len(s) <= max_len:
+                out.append(s)
+                break
+            cut = s.rfind(" ", 0, max_len + 1)
+            if cut < max(8, int(max_len * 0.4)):
+                cut = max_len
+            out.append(s[:cut].rstrip())
+            s = s[cut:].lstrip()
+        return out
+
     purchase_map = purchase_info_map or {}
     resumo: Dict[str, Dict[str, float]] = {}
 
@@ -250,9 +287,41 @@ def build_faturas_detalhamento_txt_bytes(
         slot = purchase_map.get(key) or purchase_map.get(str(key)) or {}
         documents = slot.get("documents") or []
 
+        cust_doc = (
+            slot.get("customer_doc")
+            or slot.get("cpf_cnpj")
+            or slot.get("cnpj")
+            or slot.get("cpf")
+            or getattr(inv, "customer_doc", None)
+            or getattr(inv, "cpf_cnpj", None)
+            or getattr(inv, "cnpj", None)
+            or getattr(inv, "cpf", None)
+        )
+        cust_doc = _format_doc_br(cust_doc)
+
+        inv_obs = (
+            slot.get("invoice_obs")
+            or slot.get("obs")
+            or slot.get("observacao")
+            or getattr(inv, "invoice_obs", None)
+            or getattr(inv, "obs", None)
+            or getattr(inv, "observacao", None)
+        )
+        inv_obs = _sanitize_inline(inv_obs)
+
         lines.append(_border("-"))
-        lines.append(_box_lr(f" Cliente...: {cust_code} - {cust_name}".strip(), "CPF/CNPJ:"))
-        lines.append(_box_lr(f" Fatura nr.: {inv_id}    Emissão: {issue}    Vencimento: {due}".strip(), "Obs....:"))
+        right_doc = f"CPF/CNPJ: {cust_doc}".rstrip() if cust_doc else "CPF/CNPJ:"
+        lines.append(_box_lr(f" Cliente...: {cust_code} - {cust_name}".strip(), right_doc))
+        lines.append(_box_line(f" Fatura nr.: {inv_id}    Emissão: {issue}    Vencimento: {due}".strip()))
+        obs_prefix = " Obs....: "
+        obs_max = max(10, content_inner - len(obs_prefix))
+        obs_lines = _wrap_text(inv_obs, obs_max)
+        if obs_lines:
+            for idx, chunk in enumerate(obs_lines):
+                prefix = obs_prefix if idx == 0 else (" " * len(obs_prefix))
+                lines.append(_box_line(prefix + chunk))
+        else:
+            lines.append(_box_line(" Obs....:"))
         lines.append(_border("-"))
 
         header = (
@@ -1515,7 +1584,14 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
     sacado_nome = str(boleto_data.get("sacado_nome") or "").strip()
     sacado_doc = str(boleto_data.get("sacado_inscricao") or "").strip()
     sacado_end = str(boleto_data.get("sacado_endereco") or "").strip()
+    sacado_cep = str(boleto_data.get("sacado_cep") or "").strip()
     cidade_uf = str(boleto_data.get("sacado_cidade_uf") or "").strip()
+
+    if sacado_cep:
+        digits = "".join([c for c in sacado_cep if c.isdigit()])
+        cep_fmt = f"{digits[:5]}-{digits[5:]}" if len(digits) == 8 else sacado_cep
+        if cep_fmt and ("CEP" not in sacado_end.upper()) and (cep_fmt not in sacado_end):
+            sacado_end = (sacado_end + f" - CEP {cep_fmt}").strip(" -")
 
     agencia = str(boleto_data.get("agencia") or "").strip()
     agencia_dv = str(boleto_data.get("agencia_digito") or "").strip()
@@ -1533,11 +1609,40 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
     png_cache: Dict[str, str] = {}
 
     def draw_text(x, y, text, size=9, bold=False, max_len=None, color: Optional[Tuple[float, float, float]] = None, align: str = "left"):
-        text = str(text or "").strip()
-        if max_len and len(text) > max_len:
-            text = text[: max_len - 3] + "..."
-        text = _pdf_escape(text)
-        approx_width = len(text) * (float(size) * 0.5)
+        raw_text = str(text or "").strip()
+        if max_len and len(raw_text) > max_len:
+            raw_text = raw_text[: max_len - 3] + "..."
+
+        def _text_width_pt(s: str, font_size: float, is_bold: bool) -> float:
+            widths = {
+                "0": 0.556,
+                "1": 0.556,
+                "2": 0.556,
+                "3": 0.556,
+                "4": 0.556,
+                "5": 0.556,
+                "6": 0.556,
+                "7": 0.556,
+                "8": 0.556,
+                "9": 0.556,
+                ".": 0.278,
+                ",": 0.278,
+                "/": 0.278,
+                "-": 0.333,
+                " ": 0.278,
+                ":": 0.278,
+                "(": 0.333,
+                ")": 0.333,
+            }
+            w = 0.0
+            for ch in s:
+                w += widths.get(ch, 0.556)
+            if is_bold:
+                w *= 1.03
+            return w * float(font_size)
+
+        text = _pdf_escape(raw_text)
+        approx_width = _text_width_pt(raw_text, float(size), bool(bold))
         if align == "center":
             x = float(x) - (approx_width / 2.0)
         elif align == "right":
@@ -1678,8 +1783,6 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
             x_end = x0 + half_w
             draw_line(x0, r_top, x_end, r_top, width=1)
             draw_line(x0, r_bottom, x_end, r_bottom, width=1)
-            draw_line(x0, r_bottom, x0, r_top, width=1)
-            draw_line(x_end, r_bottom, x_end, r_top, width=1)
 
             header_h = 16
             header_bottom = r_top - header_h
@@ -1690,7 +1793,7 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
             draw_line(x_logo_end2, header_bottom, x_logo_end2, r_top, width=0.8)
             draw_line(x_bank_end2, header_bottom, x_bank_end2, r_top, width=0.8)
 
-            draw_logo(x0 + 4, header_bottom + 3, 60, 12)
+            draw_logo(x0 + 4, header_bottom + 3, 62, 11)
             draw_text(x_logo_end2 + 6, header_bottom + 5, f"{bank_code}-{bank_dv}", size=11.0, bold=True)
             draw_text(x_end - 6, header_bottom + 5, title, size=8.0, bold=True, align="right")
 
@@ -1747,27 +1850,48 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
 
             cell_label(x0, c21, y2, "(=) Valor Cobrado", size=4.6)
             cell_value(x0, c21, y3, valor, bold=True, align_right=True, size=7.8)
-            cell_label(c21, c22, y2, "Nosso Número", size=4.8)
-            cell_value(c21, c22, y3, nosso_numero, bold=True, align_right=True, size=7.4)
-            cell_label(c22, x_end, y2, "Nº do Documento", size=4.8)
-            cell_value(c22, x_end, y3, documento, bold=True, align_right=True, size=7.4)
+            if is_delivery:
+                cell_label(c21, c22, y2, "Nº do Documento", size=4.8)
+                cell_value(c21, c22, y3, documento, bold=True, align_right=True, size=7.4)
+                cell_label(c22, x_end, y2, "Nosso Número", size=4.8)
+                cell_value(c22, x_end, y3, nosso_numero, bold=True, align_right=True, size=7.4)
+            else:
+                cell_label(c21, c22, y2, "Nosso Número", size=4.8)
+                cell_value(c21, c22, y3, nosso_numero, bold=True, align_right=True, size=7.4)
+                cell_label(c22, x_end, y2, "Nº do Documento", size=4.8)
+                cell_value(c22, x_end, y3, documento, bold=True, align_right=True, size=7.4)
 
             y_info_top = y3
             y_info_sep = y_info_top - line_h
             draw_text(x0 + 4, y_info_top - 5, "Pagador:", size=5.6)
-            draw_text(x0 + 4, y_info_top - 12, f"{sacado_nome} - {sacado_doc}", size=7.0, bold=True, max_len=72)
+            payer_max = _fit_chars((x_end - (x0 + 4) - 6), 7.0)
+            draw_text(x0 + 4, y_info_top - 12, f"{sacado_nome} - {sacado_doc}", size=7.0, bold=True, max_len=payer_max)
             if not is_delivery:
                 draw_line(x0, y_info_sep, x_end, y_info_sep, width=0.6)
-                draw_text(x0 + 4, y_info_sep - 5, "Beneficiário:", size=5.6)
-                draw_text(x0 + 4, y_info_sep - 12, f"{cedente_nome} - {cedente_doc}", size=6.6, bold=False, max_len=72)
+                draw_text(x0 + 4, y_info_sep - 4, "Beneficiário:", size=5.6)
+                bene_max = _fit_chars((x_end - (x0 + 4) - 6), 6.6)
+                draw_text(x0 + 4, y_info_sep - 10, f"{cedente_nome} - {cedente_doc}", size=6.6, bold=False, max_len=bene_max)
+                ced_addr = str((boleto_data or {}).get("cedente_endereco") or (boleto_data or {}).get("cedente_endereco_full") or "").strip()
+                if not ced_addr:
+                    c_log = str((boleto_data or {}).get("cedente_logradouro") or "").strip()
+                    c_nro = str((boleto_data or {}).get("cedente_numero") or "").strip()
+                    c_bai = str((boleto_data or {}).get("cedente_bairro") or "").strip()
+                    c_cid = str((boleto_data or {}).get("cedente_cidade") or "").strip()
+                    c_uf = str((boleto_data or {}).get("cedente_estado") or (boleto_data or {}).get("cedente_uf") or "").strip()
+                    c_cep = str((boleto_data or {}).get("cedente_cep") or "").strip()
+                    parts = [p for p in [c_log, c_nro, c_bai, c_cid, c_uf, c_cep] if p]
+                    if parts:
+                        ced_addr = " - ".join(parts[:3])
+                        if len(parts) > 3:
+                            ced_addr = ced_addr + " - " + " / ".join(parts[3:])
+                if ced_addr:
+                    addr_max = _fit_chars((x_end - (x0 + 4) - 6), 6.4)
+                    draw_text(x0 + 4, y_info_sep - 16, ced_addr, size=6.4, bold=False, max_len=addr_max)
             else:
                 draw_line(x0, y_info_sep, x_end, y_info_sep, width=0.6)
                 draw_text(x0 + 4, y_info_sep - 5, "Assinatura", size=5.6)
                 split_x = x0 + (half_w * 0.70)
-                draw_line(split_x, r_bottom, split_x, y_info_sep, width=0.6)
-                draw_line(x0 + 52, y_info_sep - 10, split_x - 4, y_info_sep - 10, width=0.6)
                 draw_text(split_x + 4, y_info_sep - 5, "Data de Entrega", size=5.6)
-                draw_line(split_x + 4, y_info_sep - 10, x_end - 4, y_info_sep - 10, width=0.6)
 
         set_dash(True)
         draw_line(mid, r_bottom, mid, r_top, width=0.8)
@@ -1792,7 +1916,8 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
         y_head_bottom = y_loc_top
         y_head_top = y_head_bottom + 25
 
-        draw_box(left, y_bar_bottom, width, y_head_top - y_bar_bottom, lw=1)
+        draw_line(left, y_head_top, right, y_head_top, width=1)
+        draw_line(left, y_bar_bottom, right, y_bar_bottom, width=1)
         for yy in (y_bar_top, y_pag_top, y_instr_top, y_uso_top, y_doc_top, y_ben_top, y_loc_top, y_head_bottom):
             draw_line(left, yy, right, yy, width=0.8)
 
@@ -1804,7 +1929,7 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
         draw_line(x_logo_end, y_head_bottom, x_logo_end, y_head_top, width=0.8)
         draw_line(x_bank_end, y_head_bottom, x_bank_end, y_head_top, width=0.8)
 
-        draw_logo(left + 6, y_head_bottom + 7, 110, 16)
+        draw_logo(left + 6, y_head_bottom + 5, 125, 16)
         draw_text(x_logo_end + 12, y_head_bottom + 9, f"{bank_code}-{bank_dv}", size=13, bold=True)
         draw_text(x_bank_end + 8, y_head_bottom + 10, linha_digitavel, size=8.6, bold=True)
 
@@ -1865,12 +1990,87 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
         draw_text(right - 6, y_uso_bottom + 3, valor, size=10, bold=True, align="right")
 
         draw_text(left + 6, y_instr_top - 10, "Instruções / Observações", size=6)
-        if mensagem:
-            wrapped = wrap_text(mensagem, 70)
+        show_fixed_instr = (
+            bool(mensagem)
+            or boleto_data.get("juros_perc_mes") not in (None, "")
+            or boleto_data.get("juros_valor_dia") not in (None, "")
+            or boleto_data.get("multa_perc") not in (None, "")
+            or boleto_data.get("multa_valor") not in (None, "")
+            or boleto_data.get("multa_prazo") not in (None, "")
+        )
+        if show_fixed_instr:
+            def _to_float(v):
+                try:
+                    if v is None:
+                        return 0.0
+                    if isinstance(v, (int, float)):
+                        return float(v)
+                    s = str(v).strip().replace(".", "").replace(",", ".")
+                    return float(s) if s else 0.0
+                except Exception:
+                    return 0.0
+
+            def _to_percent(v, default_percent):
+                if v in (None, ""):
+                    return float(default_percent or 0.0)
+                p = _to_float(v)
+                if 0 < p <= 1.0:
+                    p *= 100.0
+                return p
+
+            try:
+                amt = float(boleto_data.get("valor") or 0)
+            except Exception:
+                amt = 0.0
+            if not amt:
+                s_amt = pix_amount_str(valor) or ""
+                try:
+                    amt = float(s_amt) if s_amt else 0.0
+                except Exception:
+                    amt = 0.0
+
+            juros_perc_mes = _to_percent(boleto_data.get("juros_perc_mes"), 1.5)
+            multa_perc = _to_percent(boleto_data.get("multa_perc"), 2.0)
+            juros_valor_dia = _to_float(boleto_data.get("juros_valor_dia"))
+            multa_valor = _to_float(boleto_data.get("multa_valor"))
+
+            daily_interest = juros_valor_dia if juros_valor_dia > 0 else ((amt * (juros_perc_mes / 100.0) / 30.0) if amt and juros_perc_mes else 0.0)
+            multa = multa_valor if multa_valor > 0 else ((amt * (multa_perc / 100.0)) if amt and multa_perc else 0.0)
+
+            start_dt_txt = ""
+            try:
+                v = boleto_data.get("vencto")
+                if isinstance(v, datetime):
+                    base_dt = v.date()
+                elif isinstance(v, date):
+                    base_dt = v
+                else:
+                    base_dt = datetime.strptime(str(vencto or "").strip(), "%d/%m/%Y").date()
+                try:
+                    multa_prazo = int(boleto_data.get("multa_prazo") or 0)
+                except Exception:
+                    multa_prazo = 0
+                start_dt_txt = (base_dt + timedelta(days=(multa_prazo if multa_prazo > 0 else 1))).strftime("%d/%m/%Y")
+            except Exception:
+                start_dt_txt = ""
+
+            juros_perc_txt = f"{juros_perc_mes:.2f}".replace(".", ",")
+            multa_perc_txt = f"{multa_perc:.2f}".replace(".", ",")
+
+            fixed1 = f"JUROS DE MORA DE {juros_perc_txt}% AO MES (R$ {money_br(daily_interest)} / DIA)".strip() if (juros_perc_mes or daily_interest) else ""
+            fixed2 = f"MULTA DE {multa_perc_txt}% (R$ {money_br(multa)}) A PARTIR DE {start_dt_txt}".strip() if (multa_perc or multa) else ""
+
+            wrapped = []
+            if fixed1:
+                wrapped.append(fixed1)
+            if fixed2:
+                wrapped.append(fixed2)
+            if mensagem:
+                wrapped.extend([w for w in wrap_text(mensagem, 70) if str(w or "").strip()])
             start_y = y_instr_top - 35
             step_y = 11.5
             for i, line in enumerate(wrapped[:6]):
-                draw_text(left + 6, start_y - (i * step_y), line, size=8)
+                draw_text(left + 6, start_y - (i * step_y), line, size=8, bold=False)
 
         row_h = (y_instr_top - y_instr_bottom) / 4.0
         for i in range(1, 4):
@@ -1891,17 +2091,14 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
         draw_text(x_right + 6, cell4_top - 12, "(=) Valor Cobrado", size=6)
         draw_text(right - 6, cell4_bottom + 5, valor, size=9, bold=True, align="right")
 
-        x_pag_label = left + 45
-        draw_line(x_pag_label, y_pag_bottom, x_pag_label, y_pag_top, width=0.8)
+        x_pag_text = left + 60
         draw_text(left + 6, y_pag_top - 10, "Pagador", size=6)
         pag_lines = wrap_text(f"{sacado_nome} - {sacado_doc}", 70)
         if pag_lines:
-            draw_text(x_pag_label + 6, y_pag_top - 10, pag_lines[0], size=8, bold=True)
-        if len(pag_lines) > 1:
-            draw_text(x_pag_label + 6, y_pag_top - 22, pag_lines[1], size=8, bold=True)
-        draw_text(x_pag_label + 6, y_pag_bottom + 22, sacado_end, size=8)
-        draw_text(x_pag_label + 6, y_pag_bottom + 10, cidade_uf, size=8)
-        draw_text(left + 6, y_pag_bottom + 8, "Sacador / Avalista", size=6)
+            draw_text(x_pag_text, y_pag_top - 10, pag_lines[0], size=8, bold=True)
+        draw_text(x_pag_text, y_pag_bottom + 17, sacado_end, size=8)
+        draw_text(x_pag_text, y_pag_bottom + 9, cidade_uf, size=8)
+        draw_text(left + 6, y_pag_bottom + 2, "Pagador / Avalista", size=6)
 
         if codigo_barra and codigo_barra.isdigit() and len(codigo_barra) == 44:
             patterns = {
@@ -1941,8 +2138,7 @@ def build_boleto_pdf_bytes(boleto_data: Dict[str, Any], invoice_row: "InvoiceRow
                     draw_rect(bx, by, bw, bh, fill=True)
                 bx += bw
             draw_line(left + barcode_w, y_bar_bottom, left + barcode_w, y_bar_top, width=0.8)
-            draw_text(left + barcode_w + 8, y_bar_top - 10, "Código de baixa", size=6.0)
-            draw_text(left + 120, y_bar_bottom - 6, "Autenticação mecânica - Ficha de Compensação", size=5.5, bold=False)
+            draw_text(left + barcode_w + 8, y_bar_top - 10, "Autenticação mecânica - Ficha de Compensação", size=5.5, bold=False)
 
         return build_text_pdf_bytes(ops, images=pdf_images)
 
@@ -2410,7 +2606,16 @@ class EmailComposeWindow(SimpleDialog):
                 data = a.get("data")
                 if not data or not name.endswith(".xml"):
                     continue
-                pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(data, fallback_suffix=str(inv_key))
+                extra_inf = ""
+                try:
+                    extra_inf = Database(self.config_data).get_placa_km_text_bulk([inv_key]).get(inv_key) or ""
+                except Exception:
+                    extra_inf = ""
+                pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(
+                    data,
+                    fallback_suffix=str(inv_key),
+                    extra_inf_cpl_text=extra_inf,
+                )
                 if pdf_bytes and pdf_name:
                     nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
                     has_pdf = True
@@ -4363,7 +4568,16 @@ class OpenInvoicesWindow(tk.Toplevel):
                     nname = str(a.get("filename") or "").lower()
                     if not ndata or not nname.endswith(".xml"):
                         continue
-                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(ndata, fallback_suffix=str(inv.invoice_id))
+                    extra_inf = ""
+                    try:
+                        extra_inf = Database(self.config_data).get_placa_km_text_bulk([inv.invoice_id]).get(inv.invoice_id) or ""
+                    except Exception:
+                        extra_inf = ""
+                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(
+                        ndata,
+                        fallback_suffix=str(inv.invoice_id),
+                        extra_inf_cpl_text=extra_inf,
+                    )
                     if pdf_bytes and pdf_name:
                         nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
                         has_pdf = True
@@ -5895,6 +6109,13 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                 continue
             _set_progress(i, total_targets, invs[0].customer_name, to_email, "Preparando anexos")
 
+            purchase_map = {}
+            try:
+                invoice_ids = [inv.invoice_id for inv in invs if inv.invoice_id not in (None, "", 0, "0")]
+                purchase_map = Database(self.config_data).get_purchase_info_bulk(invoice_ids)
+            except Exception:
+                purchase_map = {}
+
             attachments: List[Tuple[bytes, str]] = []
             missing = 0
             for inv in invs:
@@ -5948,7 +6169,16 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                     nname = str(a.get("filename") or "").lower()
                     if not ndata or not nname.endswith(".xml"):
                         continue
-                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(ndata, fallback_suffix=str(inv.invoice_id))
+                    extra_inf = ""
+                    try:
+                        extra_inf = Database(self.config_data).get_placa_km_text_bulk([inv.invoice_id]).get(inv.invoice_id) or ""
+                    except Exception:
+                        extra_inf = ""
+                    pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(
+                        ndata,
+                        fallback_suffix=str(inv.invoice_id),
+                        extra_inf_cpl_text=extra_inf,
+                    )
                     if pdf_bytes and pdf_name:
                         nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
                         has_pdf = True
@@ -5967,13 +6197,6 @@ class FinanceiroAlertaWindow(tk.Toplevel):
 
             if dry_run:
                 continue
-
-            purchase_map = {}
-            try:
-                invoice_ids = [inv.invoice_id for inv in invs if inv.invoice_id not in (None, "", 0, "0")]
-                purchase_map = Database(self.config_data).get_purchase_info_bulk(invoice_ids)
-            except Exception:
-                purchase_map = {}
             subject = f"Alerta de vencimento de boleto - {invs[0].customer_name}"
 
             fatura_txt: Optional[Tuple[bytes, str]] = None

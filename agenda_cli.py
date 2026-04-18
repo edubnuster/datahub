@@ -379,7 +379,16 @@ def run_agenda(
                 nname = str(a.get("filename") or "").lower()
                 if not ndata or not nname.endswith(".xml"):
                     continue
-                pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(ndata, fallback_suffix=str(inv.invoice_id))
+                extra_inf = ""
+                try:
+                    extra_inf = Database(cfg).get_placa_km_text_bulk([inv.invoice_id]).get(inv.invoice_id) or ""
+                except Exception:
+                    extra_inf = ""
+                pdf_bytes, pdf_name = danfe_pdf_from_nfe_xml(
+                    ndata,
+                    fallback_suffix=str(inv.invoice_id),
+                    extra_inf_cpl_text=extra_inf,
+                )
                 if pdf_bytes and pdf_name:
                     nfe_atts.append({"data": pdf_bytes, "filename": pdf_name, "mime_type": "application/pdf"})
                     has_pdf = True

@@ -15,6 +15,14 @@ class DanfePdfTests(unittest.TestCase):
         self.assertTrue(filename.endswith(".pdf"))
         self.assertIn(b"DANFE", pdf_bytes)
 
+    def test_long_inf_cpl_creates_second_page(self):
+        extra = " ".join(["Placa: IWE6431 - KM: 500.462,00"] * 80)
+        xml = '<NFe xmlns="http://www.portalfiscal.inf.br/nfe"><infNFe Id="NFe4326"><ide><natOp>VENDA</natOp><serie>1</serie><nNF>6725</nNF><dhEmi>2026-03-26T10:10:18-03:00</dhEmi></ide><emit><CNPJ>111</CNPJ><xNome>EMITENTE</xNome><IE>ISENTO</IE><enderEmit><xLgr>RUA A</xLgr><nro>1</nro><xBairro>CENTRO</xBairro><xMun>TAPEJARA</xMun><UF>RS</UF><CEP>99950000</CEP></enderEmit></emit><dest><CNPJ>222</CNPJ><xNome>DESTINATARIO</xNome><enderDest><xLgr>RUA B</xLgr><nro>2</nro><xBairro>CENTRO</xBairro><xMun>TAPEJARA</xMun><UF>RS</UF><CEP>99950000</CEP></enderDest></dest><total><ICMSTot><vProd>1.00</vProd><vNF>1.00</vNF></ICMSTot></total><infAdic><infCpl>' + extra + '</infCpl></infAdic></infNFe></NFe>'
+        pdf_bytes, _ = danfe_pdf_from_nfe_xml(xml, fallback_suffix="x")
+        self.assertTrue(pdf_bytes and pdf_bytes.startswith(b"%PDF-"))
+        self.assertIn(b"/Count 2", pdf_bytes)
+        self.assertIn(b"Folha 1/2", pdf_bytes)
+
     def test_html_entities_are_unescaped(self):
         xml = '<NFe xmlns="http://www.portalfiscal.inf.br/nfe"><infNFe Id="NFe4326"><ide><natOp>VENDA</natOp><serie>1</serie><nNF>6725</nNF><dhEmi>2026-03-26T10:10:18-03:00</dhEmi></ide><emit><CNPJ>111</CNPJ><xNome>EMITENTE</xNome><IE>ISENTO</IE><enderEmit><xLgr>RUA A</xLgr><nro>1</nro><xBairro>CENTRO</xBairro><xMun>TAPEJARA</xMun><UF>RS</UF><CEP>99950000</CEP></enderEmit></emit><dest><CNPJ>222</CNPJ><xNome>DESTINATARIO</xNome><enderDest><xLgr>RUA B</xLgr><nro>2</nro><xBairro>CENTRO</xBairro><xMun>TAPEJARA</xMun><UF>RS</UF><CEP>99950000</CEP></enderDest></dest><total><ICMSTot><vProd>1.00</vProd><vNF>1.00</vNF></ICMSTot></total><infAdic><infCpl>REFERENTE NFC-e S&amp;Eacute;RIE: 001, N&amp;Uacute;MERO: 821394</infCpl></infAdic></infNFe></NFe>'
         pdf_bytes, _ = danfe_pdf_from_nfe_xml(xml, fallback_suffix="x")
