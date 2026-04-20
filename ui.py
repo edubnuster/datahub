@@ -20,6 +20,7 @@ from app_core.config_manager import ConfigManager
 from app_core.constants import APP_TITLE, CONFIG_PATH, LICENSE_FILENAME, MASTER_PASSWORD, MASTER_USERNAME, app_dir
 from app_core.danfe import danfe_pdf_from_nfe_xml
 from app_core.database import Database
+from app_core.email_utils import EMAIL_LOGO_CID, attach_email_logo, zip_named_files
 from app_core.helpers import AppError, format_smtp_from
 from app_core.license_manager import LicenseManager
 from app_core.models import CustomerRow, InvoiceRow
@@ -37,6 +38,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
         return "application", "xml"
     if ext == "txt":
         return "text", "plain"
+    if ext == "zip":
+        return "application", "zip"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -51,7 +54,7 @@ def _detect_email_attachment_flags(filenames: List[str]) -> Dict[str, bool]:
     has_xml = any(n.endswith(".xml") and ("nfe" in n or "xml" in n) for n in names)
     has_danfe = any(n.endswith(".pdf") and "danfe" in n for n in names)
     has_boleto = any(n.endswith(".pdf") and "boleto" in n and "danfe" not in n for n in names)
-    has_signature = any(("assinatura" in n or "cupom" in n) and (n.endswith(".pdf") or n.endswith(".png") or n.endswith(".jpg") or n.endswith(".jpeg")) for n in names)
+    has_signature = any(("assinatura" in n or "assinaturas" in n or "cupom" in n) and (n.endswith(".pdf") or n.endswith(".png") or n.endswith(".jpg") or n.endswith(".jpeg") or n.endswith(".zip")) for n in names)
     has_invoice_pdf = any(n.endswith(".pdf") and ("fatura" in n or "invoice" in n) for n in names)
     has_invoice_txt = any(n.endswith(".txt") and ("fatura" in n or "invoice" in n) for n in names)
     return {"boleto": has_boleto, "fatura_pdf": has_invoice_pdf, "fatura_txt": has_invoice_txt, "xml": has_xml, "danfe": has_danfe, "assinatura": has_signature}
@@ -873,11 +876,14 @@ def build_due_alert_email_body(
         f"{company}"
     )
 
+    logo_html = f"<div class='logo'><img src='cid:{EMAIL_LOGO_CID}' alt='Logo'></div>"
     html_body = f"""<html>
 <head>
 <style>
     body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
     .card {{ max-width: 780px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #ffffff; }}
+    .logo {{ margin: 0 0 12px 0; }}
+    .logo img {{ max-height: 60px; max-width: 240px; display: block; }}
     .title {{ font-size: 18px; font-weight: 700; color: #2563eb; margin: 0 0 10px 0; }}
     .muted {{ color: #6b7280; margin: 0 0 14px 0; }}
     table {{ border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 12px; }}
@@ -887,6 +893,7 @@ def build_due_alert_email_body(
 </head>
 <body>
   <div class="card">
+    {logo_html}
     <p class="title">Alerta de vencimento de boleto</p>
     <p class="muted">Cliente: <b>{html.escape(str(customer_name))}</b> &nbsp;|&nbsp; Data de referência: <b>{html.escape(base_txt)}</b></p>
     <p><b>Quantidade de títulos:</b> {len(invoices)}<br><b>Total em aberto:</b> {html.escape(money_br(total))}</p>
@@ -1005,11 +1012,14 @@ def build_agenda_email_body(
         f"{company}"
     )
 
+    logo_html = f"<div class='logo'><img src='cid:{EMAIL_LOGO_CID}' alt='Logo'></div>"
     html_body = f"""<html>
 <head>
 <style>
     body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
     .card {{ max-width: 780px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #ffffff; }}
+    .logo {{ margin: 0 0 12px 0; }}
+    .logo img {{ max-height: 60px; max-width: 240px; display: block; }}
     .title {{ font-size: 18px; font-weight: 700; color: #2563eb; margin: 0 0 10px 0; }}
     .muted {{ color: #6b7280; margin: 0 0 14px 0; }}
     table {{ border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 12px; }}
@@ -1019,6 +1029,7 @@ def build_agenda_email_body(
 </head>
 <body>
   <div class="card">
+    {logo_html}
     <p class="title">Faturas para programação de pagamento</p>
     <p class="muted">Cliente: <b>{html.escape(str(customer_name))}</b> &nbsp;|&nbsp; {html.escape(str(context_label))}: <b>{html.escape(str(due_text))}</b></p>
     <p><b>Quantidade de títulos:</b> {len(invoices)}<br><b>Total previsto:</b> {html.escape(money_br(total))}</p>
@@ -2767,11 +2778,14 @@ class EmailComposeWindow(SimpleDialog):
         invoice_id = str(getattr(self.invoice_row, "invoice_id", "") or "").strip()
         doc_str = invoice_id if invoice_id else "N/A"
 
+        logo_html = f"<div class='logo'><img src='cid:{EMAIL_LOGO_CID}' alt='Logo'></div>"
         return f"""<html>
 <head>
 <style>
     body {{ font-family: Arial, sans-serif; font-size: 14px; color: #333; }}
     .card {{ max-width: 780px; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #ffffff; }}
+    .logo {{ margin: 0 0 12px 0; }}
+    .logo img {{ max-height: 60px; max-width: 240px; display: block; }}
     .title {{ font-size: 18px; font-weight: 700; color: #2563eb; margin: 0 0 10px 0; }}
     .muted {{ color: #6b7280; margin: 0 0 14px 0; }}
     table {{ border-collapse: collapse; width: 100%; margin-top: 10px; margin-bottom: 12px; }}
@@ -2782,6 +2796,7 @@ class EmailComposeWindow(SimpleDialog):
 </head>
 <body>
   <div class="card">
+    {logo_html}
     <p class="title">Fatura para programação de pagamento</p>
     <p class="muted">Cliente: <b>{html.escape(self.invoice_row.customer_name)}</b> &nbsp;|&nbsp; Conta: <b>{html.escape(account_display)}</b></p>
     <p><b>Total a pagar:</b> {html.escape(self.invoice_row.open_balance_display())}</p>
@@ -2885,6 +2900,7 @@ class EmailComposeWindow(SimpleDialog):
                 if not c:
                     continue
                 html_parts.append(f"<p>{html.escape(c).replace(chr(10), '<br>')}</p>")
+            logo_html = f"<div style='margin:0 0 12px 0'><img src='cid:{EMAIL_LOGO_CID}' alt='Logo' style='max-height:60px;max-width:240px;display:block;'></div>"
             html_body = f"""<html>
 <head>
 <style>
@@ -2892,10 +2908,15 @@ class EmailComposeWindow(SimpleDialog):
 </style>
 </head>
 <body>
+{logo_html}
 {''.join(html_parts)}
 </body>
 </html>"""
             msg.add_alternative(html_body, subtype="html")
+        try:
+            attach_email_logo(msg)
+        except Exception:
+            pass
 
         include_pix_qrcode = bool(self.send_pix_qrcode_var.get())
         pdf_bytes = None
@@ -2937,20 +2958,21 @@ class EmailComposeWindow(SimpleDialog):
             sig = Database(self.config_data).get_sale_signature_pdf(getattr(self.invoice_row, "invoice_id", None))
         except Exception:
             sig = {}
-        sig_added = False
+        signature_files: List[Tuple[bytes, str]] = []
         for a in ((sig or {}).get("attachments") or []):
             data = a.get("data")
             name = a.get("filename")
-            if not data or not name:
-                continue
-            maintype, subtype = _mime_parts_from_filename(name)
-            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
-            sig_added = True
+            if data and name:
+                signature_files.append((data, name))
         sig_bytes = (sig or {}).get("attachment_data")
-        if not sig_added and (sig or {}).get("exists") and sig_bytes:
+        if not signature_files and (sig or {}).get("exists") and sig_bytes:
             name = (sig or {}).get("filename") or f"assinatura_{getattr(self.invoice_row, 'invoice_id', None) or ''}"
-            maintype, subtype = _mime_parts_from_filename(name)
-            msg.add_attachment(sig_bytes, maintype=maintype, subtype=subtype, filename=name)
+            signature_files.append((sig_bytes, name))
+        if signature_files:
+            inv_part = re.sub(r"[^0-9A-Za-z_-]+", "_", str(getattr(self.invoice_row, "invoice_id", "") or "").strip())[:40]
+            zip_name = f"assinaturas_{inv_part}.zip" if inv_part else "assinaturas.zip"
+            zip_bytes, _ = zip_named_files(signature_files, zip_filename=zip_name)
+            msg.add_attachment(zip_bytes, maintype="application", subtype="zip", filename=zip_name)
 
         nfe = self.nfe_data or {}
         for a in (nfe.get("attachments") or []):
@@ -4547,16 +4569,20 @@ class OpenInvoicesWindow(tk.Toplevel):
                 except Exception:
                     missing += 1
                 sig = signature_map.get(inv.invoice_id) or signature_map.get(str(inv.invoice_id)) or {}
-                sig_added = False
+                signature_files: List[Tuple[bytes, str]] = []
                 for a in (sig.get("attachments") or []):
                     sdata = a.get("data")
                     sname = a.get("filename")
                     if sdata and sname:
-                        attachments.append((sdata, sname))
-                        sig_added = True
+                        signature_files.append((sdata, sname))
                 sig_bytes = sig.get("attachment_data")
-                if not sig_added and sig.get("exists") and sig_bytes:
-                    attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+                if not signature_files and sig.get("exists") and sig_bytes:
+                    signature_files.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+                if signature_files:
+                    inv_part = re.sub(r"[^0-9A-Za-z_-]+", "_", str(getattr(inv, "invoice_id", "") or "").strip())[:40]
+                    zip_name = f"assinaturas_{inv_part}.zip" if inv_part else "assinaturas.zip"
+                    zip_bytes, _ = zip_named_files(signature_files, zip_filename=zip_name)
+                    attachments.append((zip_bytes, zip_name))
 
                 nfe = nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}
                 nfe_atts = list((nfe.get("attachments") or []))
@@ -4619,6 +4645,10 @@ class OpenInvoicesWindow(tk.Toplevel):
                 msg["Subject"] = subject
                 msg.set_content(text_body)
                 msg.add_alternative(html_body, subtype="html")
+                try:
+                    attach_email_logo(msg)
+                except Exception:
+                    pass
                 if fatura_txt:
                     maintype, subtype = _mime_parts_from_filename(fatura_txt[1])
                     msg.add_attachment(fatura_txt[0], maintype=maintype, subtype=subtype, filename=fatura_txt[1])
@@ -6118,6 +6148,7 @@ class FinanceiroAlertaWindow(tk.Toplevel):
 
             attachments: List[Tuple[bytes, str]] = []
             missing = 0
+            signature_files: List[Tuple[bytes, str]] = []
             for inv in invs:
                 boleto_data = boleto_map.get(inv.invoice_id) or {}
                 try:
@@ -6149,16 +6180,16 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                 except Exception:
                     missing += 1
                 sig = signature_map.get(inv.invoice_id) or {}
-                sig_added = False
+                added_for_inv = False
                 for a in (sig.get("attachments") or []):
                     sdata = a.get("data")
                     sname = a.get("filename")
                     if sdata and sname:
-                        attachments.append((sdata, sname))
-                        sig_added = True
+                        signature_files.append((sdata, sname))
+                        added_for_inv = True
                 sig_bytes = sig.get("attachment_data")
-                if not sig_added and sig.get("exists") and sig_bytes:
-                    attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+                if not added_for_inv and sig.get("exists") and sig_bytes:
+                    signature_files.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
                 nfe = nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}
                 nfe_atts = list((nfe.get("attachments") or []))
                 has_pdf = bool([a for a in nfe_atts if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")])
@@ -6192,6 +6223,11 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                     nname = a.get("filename")
                     if ndata and nname and (ndata, nname) not in attachments:
                         attachments.append((ndata, nname))
+            if signature_files:
+                cust_part = re.sub(r"[^0-9A-Za-z_-]+", "_", str(invs[0].customer_name or "").strip())[:40]
+                zip_name = f"assinaturas_{cust_part}.zip" if cust_part else "assinaturas.zip"
+                zip_bytes, _ = zip_named_files(signature_files, zip_filename=zip_name)
+                attachments.append((zip_bytes, zip_name))
             attachments_total += len(attachments)
             missing_total += missing
 
@@ -6256,6 +6292,10 @@ class FinanceiroAlertaWindow(tk.Toplevel):
                 msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
                 msg.set_content(text_body)
                 msg.add_alternative(html_body, subtype="html")
+                try:
+                    attach_email_logo(msg)
+                except Exception:
+                    pass
                 if fatura_txt:
                     maintype, subtype = _mime_parts_from_filename(fatura_txt[1])
                     msg.add_attachment(fatura_txt[0], maintype=maintype, subtype=subtype, filename=fatura_txt[1])
@@ -8497,6 +8537,7 @@ class MainApp(tk.Tk):
 
                     attachments: List[Tuple[bytes, str]] = []
                     missing = 0
+                    signature_files: List[Tuple[bytes, str]] = []
                     for inv in invs:
                         boleto_data = boleto_map.get(inv.invoice_id) or {}
                         try:
@@ -8528,16 +8569,21 @@ class MainApp(tk.Tk):
                         except Exception:
                             missing += 1
                         sig = signature_map.get(inv.invoice_id) or {}
-                        sig_added = False
+                        added_for_inv = False
                         for a in (sig.get("attachments") or []):
                             sdata = a.get("data")
                             sname = a.get("filename")
                             if sdata and sname:
-                                attachments.append((sdata, sname))
-                                sig_added = True
+                                signature_files.append((sdata, sname))
+                                added_for_inv = True
                         sig_bytes = sig.get("attachment_data")
-                        if not sig_added and sig.get("exists") and sig_bytes:
-                            attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+                        if not added_for_inv and sig.get("exists") and sig_bytes:
+                            signature_files.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.invoice_id}"))
+                    if signature_files:
+                        cust_part = re.sub(r"[^0-9A-Za-z_-]+", "_", str(invs[0].customer_name or "").strip())[:40]
+                        zip_name = f"assinaturas_{cust_part}.zip" if cust_part else "assinaturas.zip"
+                        zip_bytes, _ = zip_named_files(signature_files, zip_filename=zip_name)
+                        attachments.append((zip_bytes, zip_name))
 
                     emails_planned += 1
                     attachments_total += len(attachments)
@@ -8602,6 +8648,10 @@ class MainApp(tk.Tk):
                         msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
                         msg.set_content(text_body)
                         msg.add_alternative(html_body, subtype="html")
+                        try:
+                            attach_email_logo(msg)
+                        except Exception:
+                            pass
                         if fatura_txt:
                             maintype, subtype = _mime_parts_from_filename(fatura_txt[1])
                             msg.add_attachment(fatura_txt[0], maintype=maintype, subtype=subtype, filename=fatura_txt[1])

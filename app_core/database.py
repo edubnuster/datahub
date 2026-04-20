@@ -1421,6 +1421,54 @@ class Database:
         prod_expr = "produto_nome_f(l.produto)" if meta.get("has_produto_nome_f") else "l.produto::text"
 
         sql = f"""
+            with invoice_ids as (
+                select unnest(%s::bigint[]) as invoice_id
+            ),
+            sale_links as (
+                select
+                    mm.child as invoice_id,
+                    mm.parent as sale_id
+                from movto_map mm
+                join invoice_ids i
+                  on i.invoice_id = mm.child
+                where mm.parent is not null
+                  and mm.child is not null
+                  and mm.parent <> 0
+                  and mm.child <> 0
+
+                union
+
+                select
+                    mm1.child as invoice_id,
+                    mm2.parent as sale_id
+                from movto_map mm1
+                join movto_map mm2
+                  on mm2.child = mm1.parent
+                join invoice_ids i
+                  on i.invoice_id = mm1.child
+                where mm1.parent is not null
+                  and mm1.child is not null
+                  and mm1.parent <> 0
+                  and mm1.child <> 0
+                  and mm2.parent is not null
+                  and mm2.child is not null
+                  and mm2.parent <> 0
+                  and mm2.child <> 0
+            ),
+            sales_distinct as (
+                select distinct on (sl.invoice_id, coalesce(nullif(s.mlid, 0), s.grid))
+                    sl.invoice_id,
+                    sl.sale_id
+                from sale_links sl
+                join movto s
+                  on s.grid = sl.sale_id
+                where sl.sale_id is not null
+                  and sl.sale_id <> 0
+                order by sl.invoice_id, coalesce(nullif(s.mlid, 0), s.grid), s.grid desc
+            ),
+            has_sales as (
+                select distinct sd.invoice_id from sales_distinct sd
+            )
             select
                 inv.grid as invoice_id,
                 inv.valor as invoice_amount,
@@ -1435,6 +1483,7 @@ class Database:
               on l.mlid = inv.mlid
             where inv.grid = any(%s)
               and l.operacao = 'V'
+              and not exists (select 1 from has_sales hs where hs.invoice_id = inv.grid)
             group by inv.grid, inv.valor, inv.documento, inv.grid, {dt_expr}, product_name
 
             union all
@@ -1448,54 +1497,15 @@ class Database:
                 nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
                 sum(coalesce(l.quantidade, 0)) as quantity,
                 sum(coalesce(l.valor, 0)) as item_total
-            from movto_map mm
+            from sales_distinct sd
             join movto inv
-              on inv.grid = mm.child
+              on inv.grid = sd.invoice_id
             join movto s
-              on s.grid = mm.parent
+              on s.grid = sd.sale_id
             join lancto l
               on l.mlid = s.mlid
-            where mm.child = any(%s)
-              and mm.parent is not null
-              and mm.child is not null
-              and mm.parent <> 0
-              and mm.child <> 0
-              and l.operacao = 'V'
+            where l.operacao = 'V'
             group by inv.grid, inv.valor, s.documento, s.grid, {sale_dt_expr}, product_name
-
-            union all
-
-            select
-                inv.grid as invoice_id,
-                inv.valor as invoice_amount,
-                s2.documento as documento,
-                s2.grid as doc_movto_id,
-                {sale2_dt_expr} as dt,
-                nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
-                sum(coalesce(l.quantidade, 0)) as quantity,
-                sum(coalesce(l.valor, 0)) as item_total
-            from movto_map mm1
-            join movto inv
-              on inv.grid = mm1.child
-            join movto m1
-              on m1.grid = mm1.parent
-            join movto_map mm2
-              on mm2.child = m1.grid
-            join movto s2
-              on s2.grid = mm2.parent
-            join lancto l
-              on l.mlid = s2.mlid
-            where mm1.child = any(%s)
-              and mm1.parent is not null
-              and mm1.child is not null
-              and mm1.parent <> 0
-              and mm1.child <> 0
-              and mm2.parent is not null
-              and mm2.child is not null
-              and mm2.parent <> 0
-              and mm2.child <> 0
-              and l.operacao = 'V'
-            group by inv.grid, inv.valor, s2.documento, s2.grid, {sale2_dt_expr}, product_name
 
             order by invoice_id, dt, documento, product_name
         """
@@ -1504,7 +1514,7 @@ class Database:
         header_map: Dict[int, Dict[str, str]] = {}
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (invoice_ids_sql, invoice_ids_sql, invoice_ids_sql))
+                cur.execute(sql, (invoice_ids_sql, invoice_ids_sql))
                 rows = cur.fetchall() or []
 
             try:

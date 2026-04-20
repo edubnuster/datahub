@@ -1,6 +1,9 @@
 import unittest
 from datetime import date
+import io
+import zipfile
 
+from app_core.email_utils import zip_named_files
 from app_core.models import InvoiceRow
 from ui import (
     _detect_email_attachment_flags,
@@ -14,9 +17,16 @@ class FaturaTxtAttachmentTests(unittest.TestCase):
     def test_mime_txt(self):
         self.assertEqual(_mime_parts_from_filename("fatura_123.txt"), ("text", "plain"))
 
+    def test_mime_zip(self):
+        self.assertEqual(_mime_parts_from_filename("assinaturas.zip"), ("application", "zip"))
+
     def test_detect_flag_fatura_txt(self):
         flags = _detect_email_attachment_flags(["faturas_cliente_20260101_0000.txt"])
         self.assertTrue(flags.get("fatura_txt"))
+
+    def test_detect_flag_assinatura_zip(self):
+        flags = _detect_email_attachment_flags(["assinaturas_cliente_1.zip"])
+        self.assertTrue(flags.get("assinatura"))
 
     def test_note_mentions_fatura_txt(self):
         note = build_attachments_note_text(
@@ -28,6 +38,14 @@ class FaturaTxtAttachmentTests(unittest.TestCase):
             has_assinatura=False,
         )
         self.assertIn("fatura", note)
+
+    def test_zip_named_files(self):
+        data, name = zip_named_files([(b"abc", "assinatura_1.pdf"), (b"def", "assinatura_1.pdf")], zip_filename="assinaturas.zip")
+        self.assertTrue(name.endswith(".zip"))
+        zf = zipfile.ZipFile(io.BytesIO(data), mode="r")
+        self.assertEqual(sorted(zf.namelist()), ["assinatura_1.pdf", "assinatura_1_2.pdf"])
+        self.assertEqual(zf.read("assinatura_1.pdf"), b"abc")
+        self.assertEqual(zf.read("assinatura_1_2.pdf"), b"def")
 
     def test_build_txt_has_title_and_items(self):
         inv = InvoiceRow(

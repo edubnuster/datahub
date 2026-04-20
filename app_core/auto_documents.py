@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .database import Database
 from .danfe import danfe_pdf_from_nfe_xml
 from .documents_history import DocumentsHistory
+from .email_utils import attach_email_logo, zip_named_files
 from .helpers import AppError, format_smtp_from
 from .models import InvoiceRow
 from .logging_setup import get_docs_generated_logger, get_docs_sent_logger, get_system_logger
@@ -37,6 +38,8 @@ def _mime_parts_from_filename(filename: str) -> Tuple[str, str]:
         return "application", "xml"
     if ext == "txt":
         return "text", "plain"
+    if ext == "zip":
+        return "application", "zip"
     if ext == "png":
         return "image", "png"
     if ext in ("jpg", "jpeg"):
@@ -505,6 +508,7 @@ def run_auto_documents(
             except Exception:
                 purchase_map = {}
 
+            signature_files: List[Tuple[bytes, str]] = []
             for bg, inv in items:
                 boleto_data = payload_map.get(bg) or {}
                 try:
@@ -521,16 +525,16 @@ def run_auto_documents(
                     missing += 1
 
                 sig = signature_map.get(getattr(inv, "movto_id", None)) or {}
-                sig_added = False
+                added_for_inv = False
                 for a in (sig.get("attachments") or []):
                     data = a.get("data")
                     name = a.get("filename")
                     if data and name:
-                        attachments.append((data, name, ""))
-                        sig_added = True
+                        signature_files.append((data, name))
+                        added_for_inv = True
                 sig_bytes = sig.get("attachment_data")
-                if not sig_added and sig.get("exists") and sig_bytes:
-                    attachments.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.movto_id}", ""))
+                if not added_for_inv and sig.get("exists") and sig_bytes:
+                    signature_files.append((sig_bytes, sig.get("filename") or f"assinatura_{inv.movto_id}"))
 
                 nfe = nfe_map.get(getattr(inv, "movto_id", None)) or nfe_map.get(str(getattr(inv, "movto_id", None) or "")) or {}
                 nfe_atts = list((nfe.get("attachments") or []))
@@ -561,6 +565,11 @@ def run_auto_documents(
                     if data and name:
                         attachments.append((data, name, ""))
 
+            if signature_files:
+                cust_part = "".join([c if c.isalnum() or c in ("_", "-") else "_" for c in str(invoices[0].customer_name if invoices else "").strip()])[:40]
+                zip_name = f"assinaturas_{cust_part}.zip" if cust_part else "assinaturas.zip"
+                zip_bytes, _ = zip_named_files(signature_files, zip_filename=zip_name)
+                attachments.append((zip_bytes, zip_name, ""))
             attachments_total += len(attachments)
             missing_total += missing
             if dry_run:
@@ -667,6 +676,10 @@ def run_auto_documents(
                 msg["Subject"] = subject if len(batches) == 1 else f"{subject} ({idx}/{len(batches)})"
                 msg.set_content(text_body)
                 msg.add_alternative(html_body, subtype="html")
+                try:
+                    attach_email_logo(msg)
+                except Exception:
+                    pass
                 grids_in_batch: List[str] = []
                 if fatura_txt:
                     maintype, subtype = _mime_parts_from_filename(fatura_txt[1])
