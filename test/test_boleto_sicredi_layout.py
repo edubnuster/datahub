@@ -33,6 +33,7 @@ class BoletoSicrediLayoutTests(unittest.TestCase):
         self.assertTrue(pdf and pdf.startswith(b"%PDF-"))
         self.assertIn(b"Recibo de Entrega", pdf)
         self.assertIn(b"Recibo do Pagador", pdf)
+        self.assertIn(b"/Subtype /Image", pdf)
 
 
 if __name__ == "__main__":

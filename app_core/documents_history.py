@@ -20,6 +20,17 @@ def _iso(dt: Optional[datetime]) -> str:
         return str(dt)
 
 
+def _normalize_level(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in ("info", "informacao", "informação"):
+        return "info"
+    if raw in ("warn", "warning", "alerta", "atencao", "atenção"):
+        return "warn"
+    if raw in ("error", "erro", "err", "falha", "failed", "exception"):
+        return "error"
+    return "info"
+
+
 @dataclass(frozen=True)
 class DocumentRecord:
     boleto_grid: str
@@ -33,6 +44,28 @@ class DocumentRecord:
     last_attempt_at: str
     sent_at: str
     error: str
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    id: int
+    started_at: str
+    finished_at: str
+    status: str
+    window_start: str
+    window_end: str
+    result: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    id: int
+    created_at: str
+    kind: str
+    source: str
+    level: str
+    title: str
+    message: str
 
 
 class DocumentsHistory:
@@ -88,6 +121,22 @@ class DocumentsHistory:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT,
+                    kind TEXT,
+                    source TEXT,
+                    level TEXT,
+                    title TEXT,
+                    message TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_level ON events(level)")
             conn.commit()
 
     def start_run(self, window_start: datetime, window_end: datetime) -> int:
@@ -106,6 +155,96 @@ class DocumentsHistory:
                 "UPDATE runs SET finished_at=?, status=?, result_json=? WHERE id=?",
                 (_iso(datetime.now()), str(status or ""), json.dumps(result or {}, ensure_ascii=False), int(run_id)),
             )
+            conn.commit()
+
+    def list_runs(self, limit: int = 200) -> List[RunRecord]:
+        limit = max(1, min(5000, int(limit or 200)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, started_at, finished_at, status, window_start, window_end, result_json
+                  FROM runs
+                 ORDER BY COALESCE(NULLIF(finished_at,''), started_at) DESC, id DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        out: List[RunRecord] = []
+        for r in rows:
+            try:
+                payload = json.loads(str(r[6] or "").strip() or "{}")
+            except Exception:
+                payload = {}
+            out.append(
+                RunRecord(
+                    id=int(r[0] or 0),
+                    started_at=str(r[1] or ""),
+                    finished_at=str(r[2] or ""),
+                    status=str(r[3] or ""),
+                    window_start=str(r[4] or ""),
+                    window_end=str(r[5] or ""),
+                    result=payload if isinstance(payload, dict) else {},
+                )
+            )
+        return out
+
+    def add_event(
+        self,
+        *,
+        kind: str,
+        source: str,
+        title: str,
+        message: str,
+        level: str = "info",
+        created_at: Optional[datetime] = None,
+    ) -> int:
+        kind = str(kind or "").strip()
+        source = str(source or "").strip()
+        level = _normalize_level(level)
+        title = str(title or "").strip()
+        message = str(message or "").strip()
+        created_at = created_at or datetime.now()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO events(created_at, kind, source, level, title, message) VALUES (?,?,?,?,?,?)",
+                (_iso(created_at), kind, source, level, title, message[:4000]),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_events(self, limit: int = 500) -> List[EventRecord]:
+        limit = max(1, min(5000, int(limit or 500)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, kind, source, level, title, message
+                  FROM events
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        out: List[EventRecord] = []
+        for r in rows:
+            out.append(
+                EventRecord(
+                    id=int(r[0] or 0),
+                    created_at=str(r[1] or ""),
+                    kind=str(r[2] or ""),
+                    source=str(r[3] or ""),
+                    level=str(r[4] or ""),
+                    title=str(r[5] or ""),
+                    message=str(r[6] or ""),
+                )
+            )
+        return out
+
+    def clear_all(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM events")
+            conn.execute("DELETE FROM runs")
+            conn.execute("DELETE FROM documents")
             conn.commit()
 
     def upsert_generated(self, row: Dict[str, Any], *, allow_duplicate: bool = False) -> str:
@@ -321,6 +460,58 @@ class DocumentsHistory:
                  LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+        out: List[DocumentRecord] = []
+        for r in rows:
+            out.append(
+                DocumentRecord(
+                    boleto_grid=str(r[0] or ""),
+                    movto_id=str(r[1] or ""),
+                    customer_id=str(r[2] or ""),
+                    customer_email=str(r[3] or ""),
+                    customer_name=str(r[4] or ""),
+                    documento=str(r[5] or ""),
+                    generated_at=str(r[6] or ""),
+                    status=str(r[7] or ""),
+                    last_attempt_at=str(r[8] or ""),
+                    sent_at=str(r[9] or ""),
+                    error=str(r[10] or ""),
+                )
+            )
+        return out
+
+    def list_sent_for_email_around(
+        self,
+        to_email: str,
+        center_at: Any,
+        *,
+        window_minutes: int = 10,
+        limit: int = 300,
+    ) -> List[DocumentRecord]:
+        to_email = str(to_email or "").strip()
+        if not to_email:
+            return []
+        try:
+            dt = datetime.fromisoformat(str(center_at or "").strip())
+        except Exception:
+            return []
+        window_minutes = max(1, min(120, int(window_minutes or 10)))
+        limit = max(1, min(5000, int(limit or 300)))
+        start = _iso(dt - timedelta(minutes=window_minutes))
+        end = _iso(dt + timedelta(minutes=window_minutes))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT boleto_grid, movto_id, customer_id, customer_email, customer_name, documento, generated_at, status, last_attempt_at, sent_at, error
+                  FROM documents
+                 WHERE status = 'sent'
+                   AND lower(customer_email) = lower(?)
+                   AND sent_at >= ?
+                   AND sent_at <= ?
+                 ORDER BY sent_at DESC, boleto_grid
+                 LIMIT ?
+                """,
+                (to_email, start, end, limit),
             ).fetchall()
         out: List[DocumentRecord] = []
         for r in rows:

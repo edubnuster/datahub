@@ -282,7 +282,7 @@ def run_agenda(
 
     nfe_map = {}
     try:
-        nfe_map = Database(cfg).get_nfe_attachments_bulk(invoice_ids)
+        nfe_map = Database(cfg).get_nfe_attachments_bulk(invoice_ids, only_invoice_mlid=True, max_nfes_per_invoice=1)
     except Exception:
         nfe_map = {}
 
@@ -308,6 +308,8 @@ def run_agenda(
     failed = 0
     attachments_total = 0
     missing_total = 0
+    details: List[Dict[str, Any]] = []
+    details_truncated = False
     total_sum = 0.0
     for inv in invoices:
         try:
@@ -335,6 +337,60 @@ def run_agenda(
                 to_email = ""
         if not to_email:
             skipped_no_email += 1
+            inv_items: List[Dict[str, Any]] = []
+            try:
+                for inv in invs:
+                    boleto_data = boleto_map.get(inv.invoice_id) or {}
+                    pinfo = purchase_map.get(inv.invoice_id) or purchase_map.get(str(inv.invoice_id)) or {}
+                    pdocs = []
+                    try:
+                        for d in (pinfo.get("documents") or []):
+                            docno = str((d or {}).get("documento") or "").strip()
+                            if docno:
+                                pdocs.append(docno)
+                    except Exception:
+                        pdocs = []
+                    seen = set()
+                    uniq_pdocs = []
+                    for docno in pdocs:
+                        if docno in seen:
+                            continue
+                        seen.add(docno)
+                        uniq_pdocs.append(docno)
+                    inv_items.append(
+                        {
+                            "invoice_id": inv.invoice_id,
+                            "issue_date": str(getattr(inv, "issue_date", "") or ""),
+                            "due_date": str(getattr(inv, "due_date", "") or ""),
+                            "open_balance": float(inv.open_balance or 0) if inv.open_balance not in (None, "") else 0.0,
+                            "docs": {
+                                "boleto": bool(boleto_data.get("exists")),
+                                "boleto_filename": str(boleto_data.get("filename") or ""),
+                                "boleto_documento": str(boleto_data.get("documento") or "").strip(),
+                                "boleto_vencto_display": str(boleto_data.get("vencto_display") or "").strip(),
+                                "xml": bool([a for a in ((nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".xml") and a.get("data")]),
+                                "danfe": bool([a for a in ((nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")]),
+                                "assinatura": bool((signature_map.get(inv.invoice_id) or {}).get("exists") or (signature_map.get(inv.invoice_id) or {}).get("attachments")),
+                                "purchase_documents": uniq_pdocs[:20],
+                                "purchase_documents_truncated": bool(len(uniq_pdocs) > 20),
+                            },
+                        }
+                    )
+            except Exception:
+                inv_items = []
+            details.append(
+                {
+                    "status": "skipped_no_email",
+                    "customer_id": g.get("customer_id"),
+                    "customer_name": str(g.get("customer_name") or "").strip(),
+                    "to_email": "",
+                    "invoice_count": len(invs),
+                    "invoices": inv_items[:80],
+                    "invoices_truncated": bool(len(inv_items) > 80),
+                    "emails": [],
+                    "missing_count": 0,
+                }
+            )
             continue
 
         emails_planned += 1
@@ -343,6 +399,53 @@ def run_agenda(
         missing = 0
         total = 0.0
         signature_files: List[Tuple[bytes, str]] = []
+        inv_items: List[Dict[str, Any]] = []
+        try:
+            for inv in invs:
+                boleto_data = boleto_map.get(inv.invoice_id) or {}
+                pinfo = purchase_map.get(inv.invoice_id) or purchase_map.get(str(inv.invoice_id)) or {}
+                pdocs = []
+                try:
+                    for d in (pinfo.get("documents") or []):
+                        docno = str((d or {}).get("documento") or "").strip()
+                        if docno:
+                            pdocs.append(docno)
+                except Exception:
+                    pdocs = []
+                seen = set()
+                uniq_pdocs = []
+                for docno in pdocs:
+                    if docno in seen:
+                        continue
+                    seen.add(docno)
+                    uniq_pdocs.append(docno)
+                inv_items.append(
+                    {
+                        "invoice_id": inv.invoice_id,
+                        "issue_date": str(getattr(inv, "issue_date", "") or ""),
+                        "due_date": str(getattr(inv, "due_date", "") or ""),
+                        "open_balance": float(inv.open_balance or 0) if inv.open_balance not in (None, "") else 0.0,
+                        "docs": {
+                            "boleto": bool(boleto_data.get("exists")),
+                            "boleto_filename": str(boleto_data.get("filename") or ""),
+                            "boleto_documento": str(boleto_data.get("documento") or "").strip(),
+                            "boleto_vencto_display": str(boleto_data.get("vencto_display") or "").strip(),
+                            "xml": bool([a for a in ((nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".xml") and a.get("data")]),
+                            "danfe": bool([a for a in ((nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}).get("attachments") or []) if str(a.get("filename") or "").lower().endswith(".pdf") and a.get("data")]),
+                            "nfe_filenames": [
+                                str(a.get("filename") or "")
+                                for a in (((nfe_map.get(inv.invoice_id) or nfe_map.get(str(inv.invoice_id)) or {}).get("attachments") or []) or [])
+                                if str(a.get("filename") or "").strip()
+                            ][:10],
+                            "assinatura": bool((signature_map.get(inv.invoice_id) or {}).get("exists") or (signature_map.get(inv.invoice_id) or {}).get("attachments")),
+                            "purchase_documents": uniq_pdocs[:20],
+                            "purchase_documents_truncated": bool(len(uniq_pdocs) > 20),
+                        },
+                    }
+                )
+        except Exception:
+            inv_items = []
+
         for inv in invs:
             try:
                 total += float(inv.open_balance or 0)
@@ -410,6 +513,22 @@ def run_agenda(
         attachments_total += len(attachments)
         missing_total += missing
         if dry_run:
+            if len(details) < 200:
+                details.append(
+                    {
+                        "status": "planned",
+                        "customer_id": g.get("customer_id"),
+                        "customer_name": str(g.get("customer_name") or "").strip(),
+                        "to_email": to_email,
+                        "invoice_count": len(invs),
+                        "invoices": inv_items[:80],
+                        "invoices_truncated": bool(len(inv_items) > 80),
+                        "emails": [],
+                        "missing_count": int(missing or 0),
+                    }
+                )
+            else:
+                details_truncated = True
             continue
 
         subject = _subject_group(invs[0].customer_name)
@@ -494,11 +613,68 @@ def run_agenda(
                 _smtp_send_message(cfg, msg)
                 emails_sent += 1
                 AuditLogger.write(user_label, "agenda_envio_email_cli", f"agenda_id={agenda_id};cliente={invs[0].customer_name};para={to_email};titulos={len(invs)};anexos={len(batch) + (1 if fatura_txt else 0)};pix_incluido_no_boleto={'sim' if include_pix_qrcode else 'nao'}")
+                if len(details) < 200:
+                    att_names = [name for data, name in batch if data]
+                    if fatura_txt:
+                        att_names.append(fatura_txt[1])
+                    details.append(
+                        {
+                            "status": "sent",
+                            "customer_id": g.get("customer_id"),
+                            "customer_name": str(g.get("customer_name") or "").strip(),
+                            "to_email": to_email,
+                            "invoice_count": len(invs),
+                            "invoices": inv_items[:80],
+                            "invoices_truncated": bool(len(inv_items) > 80),
+                            "emails": [
+                                {
+                                    "batch": int(idx),
+                                    "batches_total": int(len(batches)),
+                                    "subject": str(msg.get("Subject") or ""),
+                                    "attachments": att_names[:60],
+                                    "attachments_truncated": bool(len(att_names) > 60),
+                                    "flags": dict(flags or {}),
+                                }
+                            ],
+                            "missing_count": int(missing or 0),
+                        }
+                    )
+                else:
+                    details_truncated = True
             except Exception as e:
                 failed += 1
                 AuditLogger.write(user_label, "agenda_envio_email_cli_erro", f"agenda_id={agenda_id};cliente={invs[0].customer_name};para={to_email};erro={e}")
                 if verbose:
                     print(f"[{agenda_name}] erro ao enviar para {to_email}: {e}")
+                if len(details) < 200:
+                    att_names = [name for data, name in batch if data]
+                    if fatura_txt:
+                        att_names.append(fatura_txt[1])
+                    details.append(
+                        {
+                            "status": "failed",
+                            "customer_id": g.get("customer_id"),
+                            "customer_name": str(g.get("customer_name") or "").strip(),
+                            "to_email": to_email,
+                            "invoice_count": len(invs),
+                            "invoices": inv_items[:80],
+                            "invoices_truncated": bool(len(inv_items) > 80),
+                            "emails": [
+                                {
+                                    "batch": int(idx),
+                                    "batches_total": int(len(batches)),
+                                    "subject": str(msg.get("Subject") or ""),
+                                    "attachments": att_names[:60],
+                                    "attachments_truncated": bool(len(att_names) > 60),
+                                    "flags": dict(flags or {}),
+                                    "error": str(e),
+                                }
+                            ],
+                            "missing_count": int(missing or 0),
+                        }
+                    )
+                else:
+                    details_truncated = True
 
     if dry_run:
         return {
@@ -515,6 +691,8 @@ def run_agenda(
             "missing_total": missing_total,
             "late_minutes": late_minutes,
             "out_of_time": bool(out_of_time),
+            "details": details,
+            "details_truncated": bool(details_truncated),
             "dry_run": True,
         }
 
@@ -531,6 +709,8 @@ def run_agenda(
         "missing_total": missing_total,
         "late_minutes": late_minutes,
         "out_of_time": bool(out_of_time),
+        "details": details,
+        "details_truncated": bool(details_truncated),
         "dry_run": False,
     }
 
@@ -555,6 +735,9 @@ def _update_last_run(cfg: Dict[str, Any], agenda_id: str, today_key: str, result
                 "attachments_total": int(result.get("attachments_total") or 0),
                 "missing_total": int(result.get("missing_total") or 0),
                 "emails_planned": int(result.get("emails_planned") or 0),
+                "details_version": 2,
+                "details_truncated": bool(result.get("details_truncated")),
+                "details": list(result.get("details") or []),
             }
             agendas[i] = merged
             updated = True

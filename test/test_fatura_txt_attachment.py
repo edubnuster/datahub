@@ -80,6 +80,43 @@ class FaturaTxtAttachmentTests(unittest.TestCase):
         self.assertIn("Fatura nr.: ADM3404", txt)
         self.assertIn("GASOLINA COMUM", txt)
 
+    def test_build_txt_has_placa_e_km(self):
+        inv = InvoiceRow(
+            invoice_id="ADM3404",
+            company="AUTO POSTO KANINHA LTDA",
+            customer_id=1,
+            customer_code="7384",
+            customer_name="ALEX SCHOLER LAITARTE",
+            issue_date=date(2026, 4, 13),
+            due_date=date(2026, 4, 28),
+            open_balance=75.62,
+            movto_id=100,
+        )
+        purchase_map = {
+            100: {
+                "documents": [
+                    {
+                        "documento": "12345",
+                        "dt": date(2026, 4, 13),
+                        "total": 75.62,
+                        "placa": "JAK7H93",
+                        "km_ini": 33727.0,
+                        "km_fin": 35568.0,
+                        "km_lt": 31.87,
+                        "items": [{"product": "DIESEL S10", "quantity": 57.77, "item_total": 75.62}],
+                    }
+                ],
+                "items_total": 75.62,
+                "invoice_amount": 75.62,
+            }
+        }
+        data, _ = build_faturas_detalhamento_txt_bytes([inv], purchase_info_map=purchase_map)
+        txt = data.decode("utf-8")
+        self.assertIn("JAK7H93", txt)
+        self.assertIn("33727.0", txt)
+        self.assertIn("35568.0", txt)
+        self.assertIn("31.87", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

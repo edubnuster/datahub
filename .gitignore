@@ -1,8 +1,11 @@
 app_core/__pycache__/
 __pycache__/
+.venv/
 *.pyc
 build/
 dist/
+DataHubAgenda.spec
+debug_inf_cpl_placa_km.py
 *.log
 *.zip
 *.exe
@@ -13,6 +16,3 @@ dist/
 config.json
 out*.txt
 *.gz
-danfe_emitente_logo.png
-sicredi_logo.png
-logo_sicredi.png

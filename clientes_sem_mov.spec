@@ -9,7 +9,7 @@ a = Analysis(
     ['app.py'],
     pathex=['C:\\brev\\inativos\\clientes_sem_mov_app'],
     binaries=[],
-    datas=[],
+    datas=[('danfe_emitente_logo.png', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

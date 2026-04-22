@@ -7,9 +7,9 @@ hiddenimports += collect_submodules('app_core')
 
 a = Analysis(
     ['app.py'],
-    pathex=['C:\\brev\\inativos\\clientes_sem_mov_app'],
+    pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('danfe_emitente_logo.png', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

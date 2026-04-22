@@ -880,7 +880,7 @@ def danfe_pdf_from_nfe_xml(
         end_emit += f" - {fields.get('emit_xCpl')}"
     draw_text(left + w_emit_left/2, addr_y1, end_emit, size=7, align="center", max_len=55)
     draw_text(left + w_emit_left/2, addr_y2, f"{fields.get('emit_xBairro')} - CEP {format_cep(fields.get('emit_CEP'))}", size=7, align="center")
-    draw_text(left + w_emit_left/2, addr_y3, f"{fields.get('emit_xMun')} - {fields.get('emit_UF')} Fone: {fields.get('emit_fone') or ''}", size=7, align="center")
+    draw_text(left + w_emit_left/2, addr_y3, f"{fields.get('emit_xMun')} - {fields.get('emit_UF')}", size=7, align="center")
 
     # Middle box (DANFE info)
     w_emit_mid = 85
@@ -996,8 +996,6 @@ def danfe_pdf_from_nfe_xml(
     draw_text(left + 2, y + 4, fields.get('dest_xMun'), size=8, bold=True, max_len=50)
     draw_text(right - 278, y + 14, "UF", size=5)
     draw_text(right - 278, y + 4, fields.get('dest_UF'), size=8, bold=True)
-    draw_text(right - 258, y + 14, "FONE / FAX", size=5)
-    draw_text(right - 258, y + 4, fields.get('dest_fone'), size=8, bold=True)
     draw_text(right - 148, y + 14, "INSCRIÇÃO ESTADUAL", size=5)
     draw_text(right - 148, y + 4, fields.get('dest_IE'), size=8, bold=True)
     draw_text(right - 68, y + 14, "HORA DA SAÍDA", size=5)

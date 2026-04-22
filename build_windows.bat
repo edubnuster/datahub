@@ -57,6 +57,7 @@ python -m PyInstaller ^
   --name %APP_NAME% ^
   --paths "%cd%" ^
   --hidden-import ui ^
+  --add-data "danfe_emitente_logo.png;." ^
   --collect-submodules app_core ^
   "%ENTRY_FILE%"
 if errorlevel 1 goto erro

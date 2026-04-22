@@ -485,16 +485,42 @@ class Database:
             return {}
 
         sql = """
-            select distinct inv.grid as invoice_id
-            from movto inv
-            left join movto_map mp
-              on mp.child = inv.grid
-            left join movto s
-              on s.grid = mp.parent
+            with candidate_mlid as (
+                select
+                    inv.grid as invoice_id,
+                    nullif(inv.mlid, 0) as mlid
+                from movto inv
+                where inv.grid = any(%(invoice_ids)s::bigint[])
+
+                union all
+
+                select
+                    inv.grid as invoice_id,
+                    nullif(s.mlid, 0) as mlid
+                from movto inv
+                join movto_map mp
+                  on mp.child = inv.grid
+                join movto s
+                  on s.grid = mp.parent
+                where inv.grid = any(%(invoice_ids)s::bigint[])
+
+                union all
+
+                select
+                    inv.grid as invoice_id,
+                    nullif(s.mlid, 0) as mlid
+                from movto inv
+                join movto_map mp
+                  on mp.parent = inv.grid
+                join movto s
+                  on s.grid = mp.child
+                where inv.grid = any(%(invoice_ids)s::bigint[])
+            )
+            select distinct c.invoice_id
+            from candidate_mlid c
             join nota_fiscal nf
-              on nf.mlid = coalesce(nullif(inv.mlid, 0), nullif(s.mlid, 0))
-            where inv.grid = any(%(invoice_ids)s::bigint[])
-              and coalesce(nullif(inv.mlid, 0), nullif(s.mlid, 0)) is not null
+              on nf.mlid = c.mlid
+            where c.mlid is not null
         """
 
         found: set = set()
@@ -512,10 +538,23 @@ class Database:
             out[str(int(invoice_id))] = exists
         return out
 
-    def get_nfe_attachments_bulk(self, invoice_ids: List[Any]) -> Dict[Any, Dict[str, Any]]:
+    def get_nfe_attachments_bulk(
+        self,
+        invoice_ids: List[Any],
+        *,
+        only_invoice_mlid: bool = False,
+        max_nfes_per_invoice: Optional[int] = None,
+    ) -> Dict[Any, Dict[str, Any]]:
         invoice_ids_sql = self._normalize_bigint_ids(invoice_ids)
         if not invoice_ids_sql:
             return {}
+
+        try:
+            max_n = int(max_nfes_per_invoice) if max_nfes_per_invoice is not None else None
+        except Exception:
+            max_n = None
+        if max_n is not None and max_n < 1:
+            max_n = 1
 
         out: Dict[Any, Dict[str, Any]] = {}
         for invoice_id in invoice_ids_sql:
@@ -585,11 +624,47 @@ class Database:
                 join_sql = "left join nfe_xml x on 1=0"
 
             nfs_join_sql = ""
+            order_by_sql = "order by l.invoice_id, nf.grid desc"
             if nfs_cols:
                 nfs_nf_fk = self._pick_existing_column(nfs_cols, ["nota_fiscal", "nota_fiscal_id"])
                 nfs_situacao_col = self._pick_existing_column(nfs_cols, ["situacao", "tipo_situacao", "codigo_situacao", "status"])
                 if nfs_nf_fk and nfs_situacao_col:
-                    nfs_join_sql = f"join nota_fiscal_situacao nfs on nfs.{nfs_nf_fk} = nf.grid and nfs.{nfs_situacao_col} = 310"
+                    nfs_join_sql = f"left join nota_fiscal_situacao nfs on nfs.{nfs_nf_fk} = nf.grid"
+                    order_by_sql = f"order by l.invoice_id, (case when nfs.{nfs_situacao_col} = 310 then 0 else 1 end), nf.grid desc"
+
+            candidates_sql = """
+                select
+                    inv.grid as invoice_id,
+                    nullif(inv.mlid, 0) as mlid
+                from movto inv
+                where inv.grid = any(%(invoice_ids)s::bigint[])
+            """
+            if not only_invoice_mlid:
+                candidates_sql += """
+                    union all
+
+                    select
+                        inv.grid as invoice_id,
+                        nullif(s.mlid, 0) as mlid
+                    from movto inv
+                    join movto_map mp
+                      on mp.child = inv.grid
+                    join movto s
+                      on s.grid = mp.parent
+                    where inv.grid = any(%(invoice_ids)s::bigint[])
+
+                    union all
+
+                    select
+                        inv.grid as invoice_id,
+                        nullif(s.mlid, 0) as mlid
+                    from movto inv
+                    join movto_map mp
+                      on mp.parent = inv.grid
+                    join movto s
+                      on s.grid = mp.child
+                    where inv.grid = any(%(invoice_ids)s::bigint[])
+                """
 
             sql = f"""
                 select
@@ -601,21 +676,13 @@ class Database:
                     {xml_expr},
                     {danfe_expr}
                 from (
-                    select
-                        inv.grid as invoice_id,
-                        coalesce(nullif(inv.mlid, 0), nullif(s.mlid, 0)) as mlid
-                    from movto inv
-                    left join movto_map mp
-                      on mp.child = inv.grid
-                    left join movto s
-                      on s.grid = mp.parent
-                    where inv.grid = any(%(invoice_ids)s::bigint[])
+                    {candidates_sql}
                 ) l
                 join nota_fiscal nf
                   on nf.mlid = l.mlid
                 {nfs_join_sql}
                 {join_sql}
-                order by l.invoice_id, nf.grid desc
+                {order_by_sql}
             """
 
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -623,6 +690,7 @@ class Database:
                 rows = [dict(r) for r in (cur.fetchall() or [])]
 
         seen_nf: Dict[int, set] = {}
+        nf_count: Dict[int, int] = {}
         for r in rows:
             inv_id = r.get("invoice_id")
             if inv_id in (None, "", 0, "0"):
@@ -640,10 +708,15 @@ class Database:
 
             if inv_id_i not in seen_nf:
                 seen_nf[inv_id_i] = set()
+            if inv_id_i not in nf_count:
+                nf_count[inv_id_i] = 0
             if nf_id_i and nf_id_i in seen_nf[inv_id_i]:
+                continue
+            if nf_id_i and max_n is not None and nf_count[inv_id_i] >= max_n:
                 continue
             if nf_id_i:
                 seen_nf[inv_id_i].add(nf_id_i)
+                nf_count[inv_id_i] += 1
 
             out[inv_id_i]["exists"] = True
             out[str(inv_id_i)] = out[inv_id_i]
@@ -1419,6 +1492,44 @@ class Database:
         sale_dt_expr = "s.hora" if meta.get("has_hora") else "s.data"
         sale2_dt_expr = "s2.hora" if meta.get("has_hora") else "s2.data"
         prod_expr = "produto_nome_f(l.produto)" if meta.get("has_produto_nome_f") else "l.produto::text"
+        prod_join = ""
+        product_type_select = "NULL::text"
+        product_type_group = ""
+        try:
+            with self._connect() as conn:
+                produto_cols = self._get_table_columns(conn, "produto", schema="public")
+            prod_pk_col = self._pick_existing_column(produto_cols, ["grid", "id", "produto_id", "codigo"])
+            prod_tipo_col = self._pick_existing_column(produto_cols, ["tipo", "tipo_produto", "tipo_prod", "tp"])
+            if prod_pk_col and prod_tipo_col:
+                prod_join = f"left join produto p on p.{prod_pk_col}::text = l.produto::text"
+                product_type_select = f"p.{prod_tipo_col}::text"
+                product_type_group = f", {product_type_select}"
+        except Exception:
+            prod_join = ""
+            product_type_select = "NULL::text"
+            product_type_group = ""
+
+        discount_expr = "0::numeric as invoice_discount"
+        discount_group = ""
+        doc_discount_expr_inv = "0::numeric as doc_discount"
+        doc_discount_expr_s = "0::numeric as doc_discount"
+        doc_discount_group_s = ""
+        try:
+            with self._connect() as conn:
+                movto_cols = self._get_table_columns(conn, "movto", schema="public")
+            disc_col = self._pick_existing_column(movto_cols, ["valor_desconto", "vl_desconto", "desconto", "valor_desc", "vl_desc"])
+            if disc_col:
+                discount_expr = f"coalesce(inv.{disc_col}, 0) as invoice_discount"
+                discount_group = f", coalesce(inv.{disc_col}, 0)"
+                doc_discount_expr_inv = f"coalesce(inv.{disc_col}, 0) as doc_discount"
+                doc_discount_expr_s = f"coalesce(s.{disc_col}, 0) as doc_discount"
+                doc_discount_group_s = f", coalesce(s.{disc_col}, 0)"
+        except Exception:
+            discount_expr = "0::numeric as invoice_discount"
+            discount_group = ""
+            doc_discount_expr_inv = "0::numeric as doc_discount"
+            doc_discount_expr_s = "0::numeric as doc_discount"
+            doc_discount_group_s = ""
 
         sql = f"""
             with invoice_ids as (
@@ -1472,29 +1583,38 @@ class Database:
             select
                 inv.grid as invoice_id,
                 inv.valor as invoice_amount,
+                {discount_expr},
                 inv.documento as documento,
                 inv.grid as doc_movto_id,
+                inv.valor as doc_amount,
+                {doc_discount_expr_inv},
                 {dt_expr} as dt,
                 nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
+                {product_type_select} as product_type,
                 sum(coalesce(l.quantidade, 0)) as quantity,
                 sum(coalesce(l.valor, 0)) as item_total
             from movto inv
             join lancto l
               on l.mlid = inv.mlid
+            {prod_join}
             where inv.grid = any(%s)
               and l.operacao = 'V'
               and not exists (select 1 from has_sales hs where hs.invoice_id = inv.grid)
-            group by inv.grid, inv.valor, inv.documento, inv.grid, {dt_expr}, product_name
+            group by inv.grid, inv.valor{discount_group}, inv.documento, inv.grid, {dt_expr}, product_name{product_type_group}
 
             union all
 
             select
                 inv.grid as invoice_id,
                 inv.valor as invoice_amount,
+                {discount_expr},
                 s.documento as documento,
                 s.grid as doc_movto_id,
+                s.valor as doc_amount,
+                {doc_discount_expr_s},
                 {sale_dt_expr} as dt,
                 nullif(trim(coalesce({prod_expr}::text, '')), '') as product_name,
+                {product_type_select} as product_type,
                 sum(coalesce(l.quantidade, 0)) as quantity,
                 sum(coalesce(l.valor, 0)) as item_total
             from sales_distinct sd
@@ -1504,8 +1624,9 @@ class Database:
               on s.grid = sd.sale_id
             join lancto l
               on l.mlid = s.mlid
+            {prod_join}
             where l.operacao = 'V'
-            group by inv.grid, inv.valor, s.documento, s.grid, {sale_dt_expr}, product_name
+            group by inv.grid, inv.valor{discount_group}, s.documento, s.grid, s.valor{doc_discount_group_s}, {sale_dt_expr}, product_name{product_type_group}
 
             order by invoice_id, dt, documento, product_name
         """
@@ -1553,15 +1674,32 @@ class Database:
                 header_map = {}
 
         tmp: Dict[int, Dict[str, Any]] = {}
-        for invoice_id, invoice_amount, documento, doc_movto_id, dt, product_name, quantity, item_total in rows:
+        for invoice_id, invoice_amount, invoice_discount, documento, doc_movto_id, doc_amount, doc_discount, dt, product_name, product_type, quantity, item_total in rows:
             try:
                 inv_num = float(invoice_amount) if invoice_amount not in (None, "") else None
             except Exception:
                 inv_num = None
+            try:
+                disc_num = float(invoice_discount) if invoice_discount not in (None, "") else 0.0
+            except Exception:
+                disc_num = 0.0
+            try:
+                doc_amount_num = float(doc_amount) if doc_amount not in (None, "") else None
+            except Exception:
+                doc_amount_num = None
+            try:
+                doc_disc_num = float(doc_discount) if doc_discount not in (None, "") else 0.0
+            except Exception:
+                doc_disc_num = 0.0
             slot = tmp.get(int(invoice_id))
             if not slot:
-                slot = {"invoice_amount": inv_num, "documents": {}, "dt_start": None, "dt_end": None}
+                slot = {"invoice_amount": inv_num, "invoice_discount": disc_num, "documents": {}, "dt_start": None, "dt_end": None}
                 tmp[int(invoice_id)] = slot
+            else:
+                if slot.get("invoice_amount") in (None, "") and inv_num not in (None, ""):
+                    slot["invoice_amount"] = inv_num
+                if slot.get("invoice_discount") in (None, "") and disc_num not in (None, ""):
+                    slot["invoice_discount"] = disc_num
             if dt not in (None, ""):
                 if slot["dt_start"] in (None, "") or dt < slot["dt_start"]:
                     slot["dt_start"] = dt
@@ -1570,17 +1708,25 @@ class Database:
             doc_key = str(documento or "").strip() or "N/A"
             doc = slot["documents"].get(doc_key)
             if not doc:
-                doc = {"documento": doc_key, "dt": dt, "items": {}, "total": 0.0, "movto_id": doc_movto_id}
+                doc = {"documento": doc_key, "dt": dt, "items": {}, "items_total": 0.0, "total": doc_amount_num, "doc_discount": doc_disc_num, "movto_id": doc_movto_id, "has_fuel": False}
                 slot["documents"][doc_key] = doc
             if doc.get("dt") in (None, "") and dt not in (None, ""):
                 doc["dt"] = dt
             if doc.get("movto_id") in (None, "", 0, "0") and doc_movto_id not in (None, "", 0, "0"):
                 doc["movto_id"] = doc_movto_id
-            item_key = str(product_name or "").strip() or "Item"
+            if doc.get("total") in (None, "") and doc_amount_num not in (None, ""):
+                doc["total"] = doc_amount_num
+            if doc.get("doc_discount") in (None, "") and doc_disc_num not in (None, ""):
+                doc["doc_discount"] = doc_disc_num
+            item_key_base = str(product_name or "").strip() or "Item"
+            ptype = str(product_type or "").strip()
+            item_key = item_key_base if not ptype else f"{item_key_base}||{ptype}"
             it = doc["items"].get(item_key)
             if not it:
-                it = {"product": item_key, "quantity": 0.0, "item_total": 0.0}
+                it = {"product": item_key_base, "product_type": ptype, "quantity": 0.0, "item_total": 0.0}
                 doc["items"][item_key] = it
+            if ptype.strip().upper() == "C":
+                doc["has_fuel"] = True
             try:
                 it["quantity"] += float(quantity or 0)
             except Exception:
@@ -1590,23 +1736,28 @@ class Database:
             except Exception:
                 pass
             try:
-                doc["total"] += float(item_total or 0)
+                doc["items_total"] += float(item_total or 0)
             except Exception:
                 pass
 
-        movto_doc_ids: List[int] = []
+        movto_doc_ids_all: List[int] = []
+        movto_doc_ids_fuel: List[int] = []
         for slot in (tmp or {}).values():
             for d in (slot.get("documents") or {}).values():
                 mid = d.get("movto_id")
                 if mid in (None, "", 0, "0"):
                     continue
                 try:
-                    movto_doc_ids.append(int(mid))
+                    mid_int = int(mid)
                 except Exception:
                     continue
-        movto_doc_ids = sorted(list(set(movto_doc_ids)))
+                movto_doc_ids_all.append(mid_int)
+                if d.get("has_fuel"):
+                    movto_doc_ids_fuel.append(mid_int)
+        movto_doc_ids = sorted(list(set(movto_doc_ids_all)))
+        movto_doc_ids_km = sorted(list(set(movto_doc_ids_fuel)))
 
-        placa_km_by_movto: Dict[int, Dict[str, str]] = {}
+        placa_km_by_movto: Dict[int, Dict[str, Any]] = {}
         if movto_doc_ids:
             try:
                 with self._connect() as conn:
@@ -1624,7 +1775,7 @@ class Database:
                                     mi.{info_col}::text as info
                                 from movto_info mi
                                 where mi.{fk_col} = any(%(ids)s::bigint[])
-                                  and lower(mi.{tipo_col}::text) in ('placa','km','media_km','quilometragem','odometro','hodometro','nao_detalhar_km')
+                                  and lower(mi.{tipo_col}::text) in ('placa','nao_detalhar_km')
                                 """,
                                 {"ids": movto_doc_ids},
                             )
@@ -1663,19 +1814,159 @@ class Database:
                                             slot["placa_valid"] = False
                                 elif tipo == "nao_detalhar_km":
                                     slot["no_detail_km"] = True
-                                else:
-                                    if not re.search(r"\d", info):
-                                        continue
-                                    if slot.get("no_detail_km"):
-                                        continue
-                                    if tipo == "media_km":
-                                        if not slot.get("km"):
-                                            slot["km"] = info
-                                        continue
-                                    if not slot.get("km"):
-                                        slot["km"] = info
             except Exception:
                 placa_km_by_movto = {}
+
+        if movto_doc_ids_km:
+            try:
+                with self._connect() as conn:
+                    mi_cols = self._get_table_columns(conn, "movto_info", schema="public")
+                    fk_col = self._pick_existing_column(mi_cols, ["movto", "movto_id"])
+                    tipo_col = self._pick_existing_column(mi_cols, ["tipo", "tipo_info", "chave"])
+                    info_col = self._pick_existing_column(mi_cols, ["info", "valor", "conteudo", "texto"])
+                    if fk_col and tipo_col and info_col:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                f"""
+                                select
+                                    mi.{fk_col} as movto_id,
+                                    lower(mi.{tipo_col}::text) as tipo,
+                                    mi.{info_col}::text as info
+                                from movto_info mi
+                                where mi.{fk_col} = any(%(ids)s::bigint[])
+                                  and lower(mi.{tipo_col}::text) in ('km','media_km','quilometragem','odometro','hodometro')
+                                """,
+                                {"ids": movto_doc_ids_km},
+                            )
+                            for movto_id, tipo, info in (cur.fetchall() or []):
+                                if movto_id in (None, "", 0, "0"):
+                                    continue
+                                try:
+                                    mid = int(movto_id)
+                                except Exception:
+                                    continue
+                                slot = placa_km_by_movto.get(mid)
+                                if not slot:
+                                    slot = {}
+                                    placa_km_by_movto[mid] = slot
+                                tipo = str(tipo or "").strip().lower()
+                                info = str(info or "").strip()
+                                if not tipo or not info:
+                                    continue
+                                if not re.search(r"\d", info):
+                                    continue
+                                if slot.get("no_detail_km"):
+                                    continue
+                                if tipo == "media_km":
+                                    if not slot.get("km_media"):
+                                        slot["km_media"] = info
+                                    continue
+                                if not slot.get("km"):
+                                    slot["km"] = info
+            except Exception:
+                pass
+
+        km_prev_by_movto: Dict[int, str] = {}
+        ids_for_prev: List[int] = []
+        if movto_doc_ids_km and placa_km_by_movto:
+            for mid in movto_doc_ids_km:
+                pk = placa_km_by_movto.get(mid) or {}
+                if pk.get("no_detail_km"):
+                    continue
+                if not pk.get("placa"):
+                    continue
+                if not pk.get("km"):
+                    continue
+                ids_for_prev.append(mid)
+            ids_for_prev = sorted(list(set(ids_for_prev)))
+
+        if ids_for_prev:
+            try:
+                with self._connect() as conn:
+                    mi_cols = self._get_table_columns(conn, "movto_info", schema="public")
+                    fk_col = self._pick_existing_column(mi_cols, ["movto", "movto_id"])
+                    tipo_col = self._pick_existing_column(mi_cols, ["tipo", "tipo_info", "chave"])
+                    info_col = self._pick_existing_column(mi_cols, ["info", "valor", "conteudo", "texto"])
+                    movto_cols = self._get_table_columns(conn, "movto", schema="public")
+                    dt_col = "hora" if meta.get("has_hora") else "data"
+                    if dt_col not in (movto_cols or []):
+                        dt_col = "data"
+                    if fk_col and tipo_col and info_col and dt_col:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                f"""
+                                with cur_docs as (
+                                    select
+                                        m.grid as movto_id,
+                                        m.{dt_col} as dt,
+                                        upper(regexp_replace(mi_p.{info_col}::text, '[^A-Za-z0-9]', '', 'g')) as placa
+                                    from movto m
+                                    join movto_info mi_p
+                                      on mi_p.{fk_col} = m.grid
+                                     and lower(mi_p.{tipo_col}::text) = 'placa'
+                                    where m.grid = any(%(ids)s::bigint[])
+                                )
+                                select
+                                    c.movto_id,
+                                    coalesce(prev.km_prev, '')::text as km_prev
+                                from cur_docs c
+                                left join lateral (
+                                    select
+                                        mi_km.{info_col}::text as km_prev
+                                    from movto m2
+                                    join movto_info mi_p2
+                                      on mi_p2.{fk_col} = m2.grid
+                                    join movto_info mi_km
+                                      on mi_km.{fk_col} = m2.grid
+                                    where lower(mi_p2.{tipo_col}::text) = 'placa'
+                                      and upper(regexp_replace(mi_p2.{info_col}::text, '[^A-Za-z0-9]', '', 'g')) = c.placa
+                                      and lower(mi_km.{tipo_col}::text) in ('km','quilometragem','odometro','hodometro')
+                                      and (
+                                        m2.{dt_col} < c.dt
+                                        or (m2.{dt_col} = c.dt and m2.grid < c.movto_id)
+                                      )
+                                    order by m2.{dt_col} desc, m2.grid desc
+                                    limit 1
+                                ) prev on true
+                                """,
+                                {"ids": ids_for_prev},
+                            )
+                            for movto_id, km_prev in (cur.fetchall() or []):
+                                try:
+                                    mid = int(movto_id)
+                                except Exception:
+                                    continue
+                                km_prev_by_movto[mid] = str(km_prev or "").strip()
+            except Exception:
+                km_prev_by_movto = {}
+
+        def _km_to_float(value: Any) -> Optional[float]:
+            s = str(value or "").strip()
+            if not s:
+                return None
+            cleaned = re.sub(r"[^\d,\.]", "", s)
+            if not cleaned or not re.search(r"\d", cleaned):
+                return None
+            try:
+                if "," in cleaned and "." in cleaned:
+                    return float(cleaned.replace(".", "").replace(",", "."))
+                if "," in cleaned:
+                    return float(cleaned.replace(".", "").replace(",", "."))
+                return float(cleaned)
+            except Exception:
+                return None
+
+        def _is_fuel_name(value: Any) -> bool:
+            s = str(value or "").strip().upper()
+            if not s:
+                return False
+            return any(k in s for k in ("DIESEL", "GASOLINA", "ETANOL", "ALCOOL", "GNV"))
+
+        def _is_fuel_item(it: Dict[str, Any]) -> bool:
+            t = str((it or {}).get("product_type") or "").strip().upper()
+            if t:
+                return t == "C"
+            return _is_fuel_name((it or {}).get("product"))
 
         for invoice_id in invoice_ids_sql:
             slot = tmp.get(int(invoice_id))
@@ -1686,7 +1977,9 @@ class Database:
                     "purchase_dt_start": None,
                     "purchase_dt_end": None,
                     "invoice_amount": None,
+                    "invoice_discount": 0.0,
                     "items_total": None,
+                    "items_total_gross": None,
                     "documents": [],
                     "customer_doc": hdr.get("customer_doc") or "",
                     "invoice_obs": hdr.get("invoice_obs") or "",
@@ -1695,6 +1988,7 @@ class Database:
                 continue
             documents = []
             items_total = 0.0
+            items_total_gross = 0.0
             for doc in slot["documents"].values():
                 mid = doc.get("movto_id")
                 try:
@@ -1702,18 +1996,56 @@ class Database:
                 except Exception:
                     mid_int = None
                 pk = placa_km_by_movto.get(mid_int) if mid_int is not None else {}
+                km_ini_num: Optional[float] = None
+                km_fin_num: Optional[float] = _km_to_float((pk or {}).get("km") or "")
+                km_prev_txt = km_prev_by_movto.get(mid_int) if mid_int is not None else ""
+                km_prev_num = _km_to_float(km_prev_txt)
+                if km_fin_num is not None and km_prev_num is not None:
+                    if km_fin_num > 0 and km_prev_num > 0 and km_fin_num > km_prev_num:
+                        km_ini_num = km_prev_num
+                liters = 0.0
+                for it in (doc.get("items") or {}).values():
+                    if not _is_fuel_item(it):
+                        continue
+                    try:
+                        liters += float(it.get("quantity") or 0)
+                    except Exception:
+                        continue
+                km_lt_num: Optional[float] = None
+                if km_ini_num is not None and km_fin_num is not None and liters > 0:
+                    km_delta = km_fin_num - km_ini_num
+                    if km_delta > 0:
+                        cand = km_delta / float(liters)
+                        if 0 < cand <= 80:
+                            km_lt_num = cand
                 items = [v for _, v in sorted((doc.get("items") or {}).items(), key=lambda kv: kv[0].lower())]
-                total = float(doc.get("total") or 0)
-                items_total += total
+                try:
+                    gross_total = float(doc.get("items_total") or 0)
+                except Exception:
+                    gross_total = 0.0
+                try:
+                    doc_total = float(doc.get("total")) if doc.get("total") not in (None, "") else None
+                except Exception:
+                    doc_total = None
+                base_total = doc_total if doc_total is not None else gross_total
+                items_total += float(base_total or 0)
+                items_total_gross += float(gross_total or 0)
                 documents.append(
                     {
                         "documento": doc.get("documento"),
                         "dt": doc.get("dt"),
-                        "total": total,
+                        "total": float(base_total or 0),
+                        "items_total": float(gross_total or 0),
+                        "adjustment": float(base_total or 0) - float(gross_total or 0),
+                        "doc_discount": float(doc.get("doc_discount") or 0),
                         "items": items,
                         "movto_id": doc.get("movto_id"),
                         "placa": (pk or {}).get("placa") or "",
                         "km": (pk or {}).get("km") or "",
+                        "km_media": (pk or {}).get("km_media") or "",
+                        "km_ini": km_ini_num,
+                        "km_fin": km_fin_num,
+                        "km_lt": km_lt_num,
                     }
                 )
             documents.sort(key=lambda d: (str(d.get("dt") or ""), str(d.get("documento") or "")))
@@ -1722,7 +2054,9 @@ class Database:
                 "purchase_dt_start": slot.get("dt_start"),
                 "purchase_dt_end": slot.get("dt_end"),
                 "invoice_amount": slot.get("invoice_amount"),
+                "invoice_discount": float(slot.get("invoice_discount") or 0),
                 "items_total": items_total,
+                "items_total_gross": items_total_gross,
                 "documents": documents,
                 "customer_doc": hdr.get("customer_doc") or "",
                 "invoice_obs": hdr.get("invoice_obs") or "",

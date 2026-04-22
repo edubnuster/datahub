@@ -497,7 +497,7 @@ def run_auto_documents(
             nfe_map: Dict[Any, Dict[str, Any]] = {}
             try:
                 movto_ids = [inv.movto_id for inv in invoices if getattr(inv, "movto_id", None) not in (None, "", 0, "0")]
-                nfe_map = Database(cfg).get_nfe_attachments_bulk(movto_ids)
+                nfe_map = Database(cfg).get_nfe_attachments_bulk(movto_ids, only_invoice_mlid=True, max_nfes_per_invoice=1)
             except Exception:
                 nfe_map = {}
 
@@ -707,6 +707,31 @@ def run_auto_documents(
                                 invoices[0].customer_name if invoices else "",
                                 window_text,
                             )
+                    try:
+                        labels: List[str] = []
+                        if flags.get("boleto"):
+                            labels.append("boleto")
+                        if flags.get("fatura_pdf"):
+                            labels.append("fatura (pdf)")
+                        if flags.get("fatura_txt"):
+                            labels.append("fatura (txt)")
+                        if flags.get("xml"):
+                            labels.append("xml")
+                        if flags.get("danfe"):
+                            labels.append("danfe")
+                        if flags.get("assinatura"):
+                            labels.append("assinaturas")
+                        atts_txt = ", ".join(labels) if labels else "-"
+                        docs_txt = ", ".join([str(x) for x in (grids_in_batch or [])])
+                        history.add_event(
+                            kind="auto_send_email",
+                            source="envio_auto_docs",
+                            level="info",
+                            title="E-mail enviado",
+                            message=f"Cliente: {invoices[0].customer_name if invoices else ''} | Para: {to_email} | Docs: {docs_txt} | Anexos: {atts_txt}",
+                        )
+                    except Exception:
+                        pass
                     _emit(
                         {
                             "stage": "batch_sent",
@@ -729,6 +754,17 @@ def run_auto_documents(
                     if grids_in_batch:
                         history.mark_failed(grids_in_batch, error=str(e))
                         docs_failed += len(grids_in_batch)
+                    try:
+                        docs_txt = ", ".join([str(x) for x in (grids_in_batch or [])])
+                        history.add_event(
+                            kind="auto_send_email",
+                            source="envio_auto_docs",
+                            level="error",
+                            title="Falha no envio",
+                            message=f"Cliente: {invoices[0].customer_name if invoices else ''} | Para: {to_email} | Docs: {docs_txt} | Erro: {e}",
+                        )
+                    except Exception:
+                        pass
                     system_logger.error("Falha ao enviar docs para=%s erro=%s", to_email, e)
                     _emit(
                         {
